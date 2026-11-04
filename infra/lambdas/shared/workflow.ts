@@ -1,20 +1,23 @@
+/**
+ * Analysis models offered for triage and drafting: US cross-Region inference profiles. The IAM
+ * policy of the triage and draft functions (lib/adlc-poc-stack.ts) allows exactly these.
+ */
 export const ANALYSIS_MODELS = [
   {
-    id: "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    name: "Claude Haiku 4.5",
+    id: "us.anthropic.claude-haiku-5-5",
+    name: "Claude Haiku 5.5",
   },
   {
-    id: "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-    name: "Claude Sonnet 4.5",
+    id: "us.anthropic.claude-sonnet-5-5",
+    name: "Claude Sonnet 5.5",
   },
   {
-    id: "us.anthropic.claude-opus-5",
-    name: "Claude Opus 5 (advanced)",
+    id: "us.anthropic.claude-opus-5-5",
+    name: "Claude Opus 5.5 (advanced)",
   },
 ] as const;
 
-export const DEFAULT_ANALYSIS_MODEL =
-  "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
+export const DEFAULT_ANALYSIS_MODEL = "us.anthropic.claude-sonnet-5-5";
 
 export const DEFAULT_TRIAGE_INSTRUCTION = `Classify the fix as SIMPLE when it is estimated to touch fewer than 5 files and does not introduce a new architectural pattern, external dependency, data-model change, or cross-service contract change. Classify it as COMPLEX otherwise. When context is enabled, explicitly consider architecture diagrams, entity-relationship diagrams (ERDs), cross-service contracts, schema constraints, and recorded meeting decisions as evidence. Explain the recommendation against these criteria.`;
 

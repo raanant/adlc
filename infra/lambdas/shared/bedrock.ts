@@ -8,8 +8,27 @@ const client = new BedrockRuntimeClient({ maxAttempts: 1 });
 const MAX_ATTEMPTS = 3;
 const MIN_REMAINING_TIME_MS = 1_500;
 
-/** USD per million tokens, by inference profile / model id substring. */
-const PRICING: Array<{ match: string; inPerM: number; outPerM: number }> = [
+/**
+ * USD per million tokens, by inference profile / model id substring; the first match wins, so
+ * more specific ids come first. Claude 5.5 rates are Anthropic's list prices (claude.com
+ * pricing, 2026-11-01); Bedrock bills its own regional rates, so treat run costs as estimates.
+ * Haiku 5.5 is priced by prompt length: requests over 100,000 input tokens pay the long rate.
+ */
+const PRICING: Array<{
+  match: string;
+  inPerM: number;
+  outPerM: number;
+  long?: { overInputTokens: number; inPerM: number; outPerM: number };
+}> = [
+  {
+    match: "claude-haiku-5-5",
+    inPerM: 0.1,
+    outPerM: 0.5,
+    long: { overInputTokens: 100_000, inPerM: 0.5, outPerM: 2.5 },
+  },
+  { match: "claude-sonnet-5-5", inPerM: 2.0, outPerM: 10.0 },
+  { match: "claude-opus-5-5", inPerM: 4.0, outPerM: 20.0 },
+  // Earlier models, kept so the cost of historical runs still renders.
   { match: "claude-haiku-4-5", inPerM: 1.0, outPerM: 5.0 },
   { match: "claude-sonnet-4-5", inPerM: 3.0, outPerM: 15.0 },
   { match: "claude-sonnet-4", inPerM: 3.0, outPerM: 15.0 },
@@ -25,7 +44,8 @@ export function costOf(
 ): number {
   const p = PRICING.find((x) => modelId.includes(x.match));
   if (!p) return 0;
-  return (inputTokens * p.inPerM + outputTokens * p.outPerM) / 1_000_000;
+  const rate = p.long && inputTokens > p.long.overInputTokens ? p.long : p;
+  return (inputTokens * rate.inPerM + outputTokens * rate.outPerM) / 1_000_000;
 }
 
 export interface LlmResult {

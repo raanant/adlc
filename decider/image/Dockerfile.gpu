@@ -1,0 +1,40 @@
+# Strands Decider inference image for the ADLC PoC SageMaker real-time endpoint on NVIDIA GPU
+# instances (ml.g6e.*). Same server (serve.py) and same package versions as the CPU image
+# (Dockerfile); only torch differs: its CUDA 12.6 build, which bundles the CUDA runtime
+# libraries as pip packages. The NVIDIA driver comes from the SageMaker host image
+# (InferenceAmiVersion in infra/lib/decider-config.ts).
+#
+# The image holds no model weights: SageMaker copies them from the stack's private S3 bucket to
+# /opt/ml/model before the container starts, the server loads them with HF_HUB_OFFLINE=1, and
+# the SageMaker model runs with network isolation.
+#
+# Supply chain: the base image is pinned by digest, and every Python package by version and
+# SHA-256 in requirements-gpu.txt, installed with --require-hashes.
+#
+# SageMaker expects inference containers to run as root, so there is no USER line; isolation
+# comes from network isolation and the least-privilege execution role.
+FROM public.ecr.aws/docker/library/python:3.11-slim-bookworm@sha256:94a8fee35252d06ab75856f15f12c7bae67b10e8a6da93c7fded82b2610926cd
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+COPY requirements-gpu.txt /tmp/requirements.txt
+RUN pip install --require-hashes --no-deps --only-binary=:all: \
+        --extra-index-url https://download.pytorch.org/whl/cu126 \
+        -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt \
+    && pip check
+COPY serve.py /opt/decider/serve.py
+# The NVIDIA container runtime exposes the GPU and mounts the host driver only when these are
+# set; CUDA base images set them, this slim base does not.
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    HF_HOME=/tmp/hf \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    DECIDER_DEVICE=cuda \
+    DECIDER_HOST=0.0.0.0 \
+    DECIDER_PORT=8080
+EXPOSE 8080
+ENTRYPOINT ["python", "/opt/decider/serve.py"]

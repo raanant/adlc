@@ -1,0 +1,16 @@
+{
+  "name": "adlc-poc-decider-model-fetch",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Downloads the pinned Strands Decider checkpoint and its base model for the SageMaker endpoint. Runs in AWS CodeBuild during cdk deploy.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "fetch": "tsx fetch-model.ts"
+  },
+  "dependencies": {
+    "@huggingface/hub": "2.17.8",
+    "tsx": "4.23.15"
+  }
+}

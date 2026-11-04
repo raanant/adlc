@@ -29,6 +29,10 @@ const ACTIVE_STATUSES = new Set([
   "AWAITING_APPROVAL",
   "IMPLEMENTING",
   "VALIDATING",
+  // Review gate: a reviewer may still accept this branch.
+  "AWAITING_REVIEW",
+  "ACCEPTING",
+  "CLOSING",
 ]);
 
 async function updateAudit(

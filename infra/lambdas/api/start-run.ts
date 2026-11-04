@@ -13,6 +13,8 @@ import {
   MAX_TRIAGE_INSTRUCTION_CHARS,
 } from "../shared/workflow";
 import { MCP_CONFIG_KEY, validateMcpConfig } from "../shared/mcp";
+import { getActiveDeciderVariant } from "../shared/decider-settings";
+import { DEFAULT_DECIDER_VARIANT, type DeciderVariantId } from "../shared/decider-variants";
 import { callerIdentity, response } from "./http";
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
@@ -20,6 +22,24 @@ const sfn = new SFNClient({});
 const TABLE = process.env.RUNS_TABLE!;
 const CONTEXT_TABLE = process.env.CONTEXT_TABLE ?? "";
 const STATE_MACHINE_ARN = process.env.STATE_MACHINE_ARN!;
+const SECURITY_AGENT_ENABLED = process.env.SECURITY_AGENT_ENABLED === "true";
+const SETTINGS_TABLE = process.env.SETTINGS_TABLE ?? "";
+
+/**
+ * The decision-model variant (CPU or GPU endpoint) picked in Settings, fixed for this run at
+ * submission so a later change in Settings cannot switch an in-flight run.
+ */
+async function snapshotDeciderVariant(): Promise<{ variant: DeciderVariantId; readFailed: boolean }> {
+  if (!SETTINGS_TABLE) return { variant: DEFAULT_DECIDER_VARIANT, readFailed: false };
+  try {
+    return { variant: (await getActiveDeciderVariant(ddb, SETTINGS_TABLE)).variant, readFailed: false };
+  } catch (error) {
+    console.warn("decision model setting read failed; using the default variant", {
+      name: (error as Error)?.name,
+    });
+    return { variant: DEFAULT_DECIDER_VARIANT, readFailed: true };
+  }
+}
 
 /**
  * Snapshot the caller's saved MCP configuration at submission time so the run
@@ -61,6 +81,7 @@ interface StartRunBody {
   autoExecuteSimple?: unknown;
   securityRemediation?: unknown;
   securityMode?: unknown;
+  decisionModelEnabled?: unknown;
 }
 
 export const handler = async (
@@ -95,10 +116,16 @@ export const handler = async (
     body.autoExecuteSimple === undefined ? false : body.autoExecuteSimple;
   const securityRemediation =
     body.securityRemediation === undefined ? false : body.securityRemediation;
-  const securityMode =
+  // Optional informative second opinion from the Strands Decider endpoint; never changes routing.
+  const decisionModelEnabled =
+    body.decisionModelEnabled === undefined ? false : body.decisionModelEnabled;
+  const requestedSecurityMode =
     typeof body.securityMode === "string" && ["skip", "scan", "remediate"].includes(body.securityMode)
       ? body.securityMode
       : (body.securityRemediation === true ? "remediate" : "scan");
+  // Without a provisioned agent space (cdk deploy -c securityAgent=false) there is nothing to
+  // run the review in, so the run skips it instead of failing after validation.
+  const securityMode = SECURITY_AGENT_ENABLED ? requestedSecurityMode : "skip";
 
   if (typeof includeContext !== "boolean") {
     return response(400, { error: "includeContext must be a boolean" });
@@ -108,6 +135,9 @@ export const handler = async (
   }
   if (typeof securityRemediation !== "boolean") {
     return response(400, { error: "securityRemediation must be a boolean" });
+  }
+  if (typeof decisionModelEnabled !== "boolean") {
+    return response(400, { error: "decisionModelEnabled must be a boolean" });
   }
 
   if (!bugText) return response(400, { error: "bugText is required" });
@@ -134,6 +164,9 @@ export const handler = async (
   const now = new Date().toISOString();
   const workflowVersion = 2;
   const { mcpConfig, mcpEnabledServers } = await snapshotMcpConfig(user.sub);
+  const decider = decisionModelEnabled
+    ? await snapshotDeciderVariant()
+    : { variant: undefined, readFailed: false };
 
   await ddb.send(
     new PutCommand({
@@ -149,6 +182,8 @@ export const handler = async (
         autoExecuteSimple,
         securityRemediation,
         securityMode,
+        decisionModelEnabled,
+        ...(decider.variant ? { decisionModelVariant: decider.variant } : {}),
         mcpConfig,
         mcpEnabledServers,
         workflowVersion,
@@ -171,6 +206,16 @@ export const handler = async (
             stage: "workflow",
             message: `Run accepted; analysis model: ${analysisModel}; implementation model: ${kiroModel}`,
           },
+          ...(securityMode !== requestedSecurityMode
+            ? [
+                {
+                  ts: now,
+                  level: "WARN",
+                  stage: "workflow",
+                  message: `Security review "${requestedSecurityMode}" was requested but AWS Security Agent is not provisioned in this deployment; the run skips it`,
+                },
+              ]
+            : []),
           ...(mcpEnabledServers.length > 0
             ? [
                 {
@@ -181,8 +226,24 @@ export const handler = async (
                 },
               ]
             : []),
+          ...(decider.variant
+            ? [
+                {
+                  ts: now,
+                  level: decider.readFailed ? "WARN" : "INFO",
+                  stage: "decision-model",
+                  message: decider.readFailed
+                    ? `The decision model setting could not be read; this run uses the default ${decider.variant.toUpperCase()} endpoint`
+                    : `Decision model second opinion uses the ${decider.variant.toUpperCase()} endpoint (selected in Settings)`,
+                },
+              ]
+            : []),
         ],
-        logCount: mcpEnabledServers.length > 0 ? 2 : 1,
+        logCount:
+          1 +
+          (mcpEnabledServers.length > 0 ? 1 : 0) +
+          (securityMode !== requestedSecurityMode ? 1 : 0) +
+          (decider.variant ? 1 : 0),
       },
     })
   );
@@ -201,6 +262,10 @@ export const handler = async (
         autoExecuteSimple,
         securityRemediation,
         securityMode,
+        decisionModelEnabled,
+        // Always present so the state machine's JSONPath reads it; the step ignores it when the
+        // second opinion is off.
+        decisionModelVariant: decider.variant ?? DEFAULT_DECIDER_VARIANT,
         ownerSub: user.sub,
         workflowVersion,
       }),

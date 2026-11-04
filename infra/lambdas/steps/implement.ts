@@ -48,6 +48,39 @@ export interface ImplementResult {
   agentCoreUsageStatus?: UsageStatus;
   agentCoreUsageSource?: string;
   error?: string;
+  /** Normalized build error lines of this attempt (see shared/build-gate.ts). */
+  buildErrors?: string[];
+  /** The fix was already on the branch from an earlier attempt; nothing new was committed. */
+  noNewChanges?: boolean;
+  /** The run's base-commit build, as measured before Kiro edited anything. */
+  baselineBuild?: BaselineBuild;
+}
+
+export interface BaselineBuild {
+  ok: boolean;
+  errors: string[];
+  commitId?: string;
+  outputTail?: string;
+}
+
+function baselineOf(value: unknown): BaselineBuild | undefined {
+  const r = value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+  if (!r || typeof r.ok !== "boolean") return undefined;
+  return {
+    ok: r.ok,
+    errors: Array.isArray(r.errors) ? r.errors.filter((e): e is string => typeof e === "string").slice(0, 50) : [],
+    ...(typeof r.commitId === "string" ? { commitId: r.commitId } : {}),
+    ...(typeof r.outputTail === "string" ? { outputTail: r.outputTail.slice(-1500) } : {}),
+  };
+}
+
+/** Guidance from every "retry with guidance" review decision, oldest first. */
+function reviewerGuidanceOf(run: Record<string, unknown> | undefined): string[] {
+  const decisions = Array.isArray(run?.reviewDecisions) ? run.reviewDecisions : [];
+  return decisions
+    .map((d) => (d && typeof d === "object" ? (d as Record<string, unknown>) : {}))
+    .filter((d) => d.action === "retry" && typeof d.guidance === "string" && d.guidance.trim())
+    .map((d) => String(d.guidance));
 }
 
 export const handler = async (event: {
@@ -90,12 +123,16 @@ export const handler = async (event: {
     executionMode,
     approvedArtifact,
   });
+  const storedBaseline = baselineOf(existingRun?.baselineBuild);
+  const reviewerGuidance = reviewerGuidanceOf(existingRun);
   await appendEvent(
     runId,
     "IMPLEMENT",
     attempt === 1
       ? `Coding agent implementing the approved ${executionMode} artifact (requested Kiro model: ${kiroModel})`
-      : `Fix loop iteration ${attempt}: coding agent addressing validation findings using the frozen ${executionMode} artifact`
+      : reviewerGuidance.length > 0
+        ? `Attempt ${attempt}: coding agent retrying with reviewer guidance and the latest validation findings (${executionMode} artifact)`
+        : `Fix loop iteration ${attempt}: coding agent addressing validation findings using the frozen ${executionMode} artifact`
   );
 
   await acquireImplementationLease(fixBranch);
@@ -116,6 +153,9 @@ export const handler = async (event: {
       attempt,
       runtimeSessionId,
       mcpConfig,
+      // Measured once per run, on the first attempt; later attempts reuse it.
+      ...(storedBaseline ? { baselineBuild: storedBaseline } : {}),
+      ...(reviewerGuidance.length > 0 ? { reviewerGuidance } : {}),
     };
 
     const res = await client.send(
@@ -140,8 +180,16 @@ export const handler = async (event: {
           ? (parsed as { result: unknown }).result
           : parsed;
       const agentResult = inner as ImplementResult;
+      const measuredBaseline = baselineOf(agentResult.baselineBuild);
       result = {
         ...agentResult,
+        buildErrors: Array.isArray(agentResult.buildErrors)
+          ? agentResult.buildErrors.filter((e): e is string => typeof e === "string").slice(0, 50)
+          : [],
+        noNewChanges: agentResult.noNewChanges === true,
+        ...(storedBaseline ?? measuredBaseline
+          ? { baselineBuild: storedBaseline ?? measuredBaseline }
+          : {}),
         baseCommitId,
         fixBranch,
         attempt,
@@ -191,7 +239,9 @@ export const handler = async (event: {
     runId,
     "IMPLEMENT",
     result.ok
-      ? `Fix implemented via ${result.engine} in ${executionMode} mode: ${result.summary.slice(0, 200)} (build ${result.buildOk ? "PASSED" : "FAILED"})`
+      ? result.noNewChanges
+        ? `No new changes: the fix from an earlier attempt is already on ${fixBranch}; it goes to validation again (build ${result.buildOk ? "PASSED" : "FAILED"})`
+        : `Fix implemented via ${result.engine} in ${executionMode} mode: ${result.summary.slice(0, 200)} (build ${result.buildOk ? "PASSED" : "FAILED"})`
       : `Implementation attempt failed: ${result.error ?? result.summary}`,
     result.costUsd || 0,
     {
@@ -219,6 +269,15 @@ export const handler = async (event: {
     baseCommitId,
     executionMode,
     ...(result.fixCommitId ? { fixCommitId: result.fixCommitId } : {}),
+    ...(!storedBaseline && result.baselineBuild ? { baselineBuild: result.baselineBuild } : {}),
   });
+  if (!storedBaseline && result.baselineBuild && !result.baselineBuild.ok) {
+    await appendEvent(
+      runId,
+      "IMPLEMENT",
+      `The base commit already fails to build (${result.baselineBuild.errors.length} error line(s)); ` +
+        "those errors are treated as pre-existing, and the fix must not add new ones"
+    );
+  }
   return result;
 };

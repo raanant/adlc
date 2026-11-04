@@ -1,5 +1,7 @@
 import { useState } from "react";
 import { api } from "./api";
+import { DecisionModelCard, DecisionModelGateSummary, decisionModelView } from "./DecisionModelCard";
+import { ReviewHistory, ReviewPanel } from "./ReviewPanel";
 import type { ExecutionMode, Report, Run, RunEvent, RunLog, SecurityReview, UsageStatus } from "./types";
 import {
   displayStatus,
@@ -18,12 +20,22 @@ import {
 const PHASE_ICONS: Record<string, string> = {
   SUBMITTED: "1.",
   TRIAGE: "2.",
+  DECISION_MODEL: "2b.",
   DRAFT: "3.",
   GATE: "4.",
   IMPLEMENT: "5.",
   VALIDATE: "6.",
+  REVIEW: "6b.",
   REPORT: "7.",
 };
+
+/** Badge colour for a run status: green only for a validated, completed run. */
+export function runStatusTone(status: string | null): "ok" | "warn" | "bad" | "info" {
+  if (status === "COMPLETED") return "ok";
+  if (status && ["AWAITING_APPROVAL", "AWAITING_REVIEW", "ACCEPTED_BY_REVIEWER", "CANCELLED"].includes(status)) return "warn";
+  if (status && ["FAILED", "REJECTED", "NEEDS_HUMAN"].includes(status)) return "bad";
+  return "info";
+}
 
 function safeUsageStatus(value: unknown): UsageStatus {
   return value === "COMPLETE" || value === "PARTIAL" ||
@@ -40,6 +52,7 @@ function ApprovalPanel({ run, onChanged }: { run: Run; onChanged: () => void }) 
     optionalString(run.draft?.simplePrompt) ?? optionalString(run.draft?.proposedFix) ?? ""
   );
   const [complexSpec, setComplexSpec] = useState(optionalString(run.draft?.complexSpec) ?? "");
+  const decisionView = decisionModelView(run);
   const [feedback, setFeedback] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -78,6 +91,7 @@ function ApprovalPanel({ run, onChanged }: { run: Run; onChanged: () => void }) 
         Triage is advisory. Choose either path, review its independently editable artifact,
         then freeze it for implementation and validation.
       </p>
+      {decisionView && <DecisionModelGateSummary view={decisionView} />}
 
       <div className="mode-card-grid" role="radiogroup" aria-label="Execution mode">
         <button
@@ -499,6 +513,9 @@ export function RunDetail({
   const attempt =
     safeNonNegativeNumber(implementation?.attempt) ??
     safeNonNegativeNumber(validation?.fixAttempts);
+  const attemptBudget = safeNonNegativeNumber(run.attemptBudget) ?? 3;
+  const buildGate = safeRecord(validation?.buildGate);
+  const buildVerdict = optionalString(buildGate?.verdict);
   const logs = safeObjectArray<RunLog>(run.logs);
   const events = safeObjectArray<RunEvent>(run.events);
   const displayRunStatus = displayStatus(status);
@@ -506,7 +523,7 @@ export function RunDetail({
     <div>
       <div className="detail-header">
         <h2>{safeString(triage?.title, runId ? `Run ${shortId(runId)}` : "Run unavailable")}</h2>
-        <span className={`badge big ${status === "COMPLETED" ? "ok" : status && ["AWAITING_APPROVAL", "CANCELLED"].includes(status) ? "warn" : status && ["FAILED", "REJECTED", "NEEDS_HUMAN"].includes(status) ? "bad" : "info"}`}>
+        <span className={`badge big ${runStatusTone(status)}`}>
           {displayRunStatus}
         </span>
       </div>
@@ -519,6 +536,8 @@ export function RunDetail({
           file(s)) — {safeString(triage.reasoning)}
         </p>
       )}
+
+      <DecisionModelCard run={run} />
 
       <p className="muted model-summary">
         Analysis model: <code>{safeString(run.analysisModel, "default")}</code>
@@ -534,9 +553,24 @@ export function RunDetail({
         <ApprovalPanel run={run} onChanged={onChanged} />
       )}
 
-      {validation && validation.pass === false && issues.length > 0 && (
+      {status === "AWAITING_REVIEW" && (
+        <ReviewPanel run={run} onChanged={onChanged} onInspectFix={onInspectFix} />
+      )}
+
+      {status === "ACCEPTED_BY_REVIEWER" && (
+        <div className="notice warn-notice" role="status">
+          Accepted by a reviewer without a green validation. See the review decisions below for who
+          accepted it, why, and which checks had failed.
+        </div>
+      )}
+
+      {validation && validation.pass === false && issues.length > 0 && status !== "AWAITING_REVIEW" && (
         <div className="card bad-border">
-          <h3>Validation findings (fix loop in progress)</h3>
+          <h3>
+            {status && ["IMPLEMENTING", "VALIDATING"].includes(status)
+              ? "Validation findings (fix loop in progress)"
+              : "Last validation findings"}
+          </h3>
           <ul>
             {issues.map((issue, index) => (
               <li key={index}>{safeString(issue)}</li>
@@ -544,6 +578,8 @@ export function RunDetail({
           </ul>
         </div>
       )}
+
+      <ReviewHistory run={run} />
 
       <ReportCard run={run} />
 
@@ -574,9 +610,21 @@ export function RunDetail({
           <div className="verification-metrics" aria-label="Verification results">
             <div>
               <span>Build gate</span>
-              <strong className={buildOk === true ? "text-pass" : buildOk === false ? "text-fail" : ""}>
-                {buildOk === true ? "Passed" : buildOk === false ? "Failed" : "Unavailable"}
-              </strong>
+              {buildVerdict ? (
+                <strong className={buildGate?.ok === true ? "text-pass" : "text-fail"}>
+                  {buildVerdict === "PASSED"
+                    ? "Passed"
+                    : buildVerdict === "PRE_EXISTING_ONLY"
+                      ? "Passed (pre-existing errors only)"
+                      : buildVerdict === "NEW_ERRORS"
+                        ? "Failed: new errors"
+                        : "Failed"}
+                </strong>
+              ) : (
+                <strong className={buildOk === true ? "text-pass" : buildOk === false ? "text-fail" : ""}>
+                  {buildOk === true ? "Passed" : buildOk === false ? "Failed" : "Unavailable"}
+                </strong>
+              )}
             </div>
             <div>
               <span>Checks passed</span>
@@ -586,15 +634,15 @@ export function RunDetail({
             </div>
             <div>
               <span>Implementation attempt</span>
-              <strong>{attempt ?? "—"}/3</strong>
+              <strong>{attempt ?? "—"}/{attemptBudget}</strong>
             </div>
           </div>
 
           <ol className="verification-layers">
             <li><span>1</span><div><strong>Frozen artifact</strong><small>The approved prompt or spec is reused unchanged for every attempt.</small></div></li>
-            <li><span>2</span><div><strong>Hard build gate</strong><small>A failed project build cannot be reported as a validated fix.</small></div></li>
-            <li><span>3</span><div><strong>Independent validator</strong><small>Validation reviews the repository result against the frozen artifact.</small></div></li>
-            <li><span>4</span><div><strong>Three-attempt loop</strong><small>Validation findings can drive bounded retries without changing the approval.</small></div></li>
+            <li><span>2</span><div><strong>Build gate against the base commit</strong><small>The fix must build, or add no error to a base commit that already fails; pre-existing errors are reported, never hidden.</small></div></li>
+            <li><span>3</span><div><strong>Independent validator</strong><small>Validation reviews the diff against the frozen artifact, including when the build fails.</small></div></li>
+            <li><span>4</span><div><strong>Bounded retries, then a human</strong><small>Up to three automatic attempts, stopped early when another one cannot help; then a reviewer accepts, retries with guidance, or closes.</small></div></li>
             <li><span>5</span><div><strong>Security Agent review</strong><small>AWS Security Agent runs automated penetration testing and code security analysis.</small></div></li>
             <li><span>6</span><div><strong>Immutable diff + human inspection</strong><small>The fix branch preserves the source diff and evidence for direct review.</small></div></li>
           </ol>

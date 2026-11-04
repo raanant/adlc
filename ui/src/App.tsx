@@ -2,11 +2,12 @@ import { useCallback, useEffect, useRef, useState, type CSSProperties, type Keyb
 import { Authenticator } from "@aws-amplify/ui-react";
 import "@aws-amplify/ui-react/styles.css";
 import { api } from "./api";
-import type { ModelOption, Run } from "./types";
-import { RunDetail } from "./RunDetail";
+import type { DecisionModelStatus, ModelOption, Run } from "./types";
+import { RunDetail, runStatusTone } from "./RunDetail";
 import { RepositoryBrowser } from "./RepositoryBrowser";
 import { ContextTab } from "./ContextTab";
 import { McpTab } from "./McpTab";
+import { SettingsTab } from "./SettingsTab";
 import { UserGuide } from "./UserGuide";
 import { ErrorBoundary } from "./ErrorBoundary";
 import {
@@ -46,6 +47,34 @@ function modelOptions(value: unknown): ModelOption[] {
   );
 }
 
+function decisionModelStatusOf(value: unknown): DecisionModelStatus | null {
+  const record = safeRecord(value);
+  if (!record) return null;
+  return {
+    available: record.available === true,
+    variant: record.variant === "cpu" || record.variant === "gpu" ? record.variant : null,
+    label: safeString(record.label, ""),
+    instanceType: safeString(record.instanceType, ""),
+    status: safeString(record.status, "UNKNOWN"),
+    endpointName: safeString(record.endpointName, ""),
+    modelId: safeString(record.modelId, ""),
+  };
+}
+
+function decisionModelStatusText(status: DecisionModelStatus | null, loading: boolean): string {
+  if (loading) return "Checking the decision model endpoint…";
+  if (!status) return "Decision model status is unavailable.";
+  const which = status.label
+    ? `The ${status.label} endpoint${status.instanceType ? ` (${status.instanceType})` : ""}, picked in Settings,`
+    : "The endpoint picked in Settings";
+  if (status.available) return `${which} is running.`;
+  if (status.status === "NOT_DEPLOYED") {
+    return `${which} is stopped (not billed). Deploy it from Settings to use this option.`;
+  }
+  if (status.status === "NOT_CONFIGURED") return "Not configured for this deployment.";
+  return `${which} is ${status.status.replace(/_/g, " ")}; the option is available once it is InService.`;
+}
+
 const PRESETS: Array<{ label: string; text: string }> = [
   {
     label: "BUG-001 — Build broken (TS2345)",
@@ -78,35 +107,59 @@ function NewRunForm({ onStarted }: { onStarted: (runId: string) => void }) {
   const [includeContext, setIncludeContext] = useState(false);
   const [autoExecuteSimple, setAutoExecuteSimple] = useState(false);
   const [securityMode, setSecurityMode] = useState<"skip" | "scan" | "remediate">("scan");
+  const [securityAgentEnabled, setSecurityAgentEnabled] = useState(true);
+  const [decisionModelEnabled, setDecisionModelEnabled] = useState(false);
+  const [decisionModelStatus, setDecisionModelStatus] = useState<DecisionModelStatus | null>(null);
   const [kiroConfigured, setKiroConfigured] = useState(false);
   const [modelsLoading, setModelsLoading] = useState(true);
+  const [kiroDiscoveryPending, setKiroDiscoveryPending] = useState(false);
   const [modelError, setModelError] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
     let active = true;
-    api
-      .listModels()
-      .then((resultValue) => {
-        if (!active) return;
-        const result = safeRecord(resultValue);
-        if (!result) throw new Error("Model catalog is unavailable");
-        setModels(modelOptions(result.models));
-        setAnalysisModels(modelOptions(result.analysisModels));
-        setAnalysisModel(safeString(result.defaultAnalysisModel, ""));
-        setTriageInstruction(safeString(result.defaultTriageInstruction, ""));
-        setKiroConfigured(result.kiroConfigured === true);
-        setModelError(optionalString(result.error) ?? "");
-      })
-      .catch((e) => {
-        if (active) setModelError(`Model discovery failed: ${String(e)}`);
-      })
-      .finally(() => {
-        if (active) setModelsLoading(false);
-      });
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let firstLoad = true;
+    // While the coding agent's container is starting, /models answers with the analysis models
+    // and kiroDiscoveryPending; retry a few times so the Kiro models appear without a reload.
+    const load = (attempt: number) => {
+      api
+        .listModels()
+        .then((resultValue) => {
+          if (!active) return;
+          const result = safeRecord(resultValue);
+          if (!result) throw new Error("Model catalog is unavailable");
+          if (firstLoad) {
+            // Only the first answer sets defaults, so a retry never overwrites user edits.
+            firstLoad = false;
+            setAnalysisModels(modelOptions(result.analysisModels));
+            setAnalysisModel(safeString(result.defaultAnalysisModel, ""));
+            setTriageInstruction(safeString(result.defaultTriageInstruction, ""));
+            setDecisionModelStatus(decisionModelStatusOf(result.decisionModel));
+            const securityEnabled = safeRecord(result.securityAgent)?.enabled !== false;
+            setSecurityAgentEnabled(securityEnabled);
+            if (!securityEnabled) setSecurityMode("skip");
+            setModelsLoading(false);
+          }
+          setModels(modelOptions(result.models));
+          setKiroConfigured(result.kiroConfigured === true);
+          const pending = result.kiroDiscoveryPending === true && attempt < 4;
+          setKiroDiscoveryPending(pending);
+          setModelError(pending ? "" : optionalString(result.error) ?? "");
+          if (pending) retryTimer = setTimeout(() => load(attempt + 1), 5_000);
+        })
+        .catch((e) => {
+          if (!active) return;
+          setModelError(`Model discovery failed: ${String(e)}`);
+          setKiroDiscoveryPending(false);
+          setModelsLoading(false);
+        });
+    };
+    load(1);
     return () => {
       active = false;
+      if (retryTimer) clearTimeout(retryTimer);
     };
   }, []);
 
@@ -123,6 +176,7 @@ function NewRunForm({ onStarted }: { onStarted: (runId: string) => void }) {
         includeContext,
         autoExecuteSimple,
         securityMode,
+        decisionModelEnabled: decisionModelEnabled && decisionModelStatus?.available === true,
       }));
       const runId = optionalString(result?.runId);
       if (!runId) throw new Error("The run started without a usable run ID.");
@@ -203,11 +257,38 @@ function NewRunForm({ onStarted }: { onStarted: (runId: string) => void }) {
         />
         <span><strong>Auto-execute simple fixes</strong><small>Skip human approval only when triage returns SIMPLE. Complex fixes always pause for review.</small></span>
       </label>
+      <label className={`include-context-option ${decisionModelStatus?.available ? "" : "option-disabled"}`}>
+        <input
+          type="checkbox"
+          checked={decisionModelEnabled && decisionModelStatus?.available === true}
+          disabled={modelsLoading || decisionModelStatus?.available !== true}
+          onChange={(event) => setDecisionModelEnabled(event.target.checked)}
+        />
+        <span>
+          <strong>Decision model second opinion</strong>
+          <small>
+            Also ask the Strands Decider model five yes/no checks about the bug, from which a
+            SIMPLE or COMPLEX verdict follows. Informative only: routing and auto-execution still
+            follow the LLM triage.
+          </small>
+          <small className="decision-model-availability">
+            {decisionModelStatusText(decisionModelStatus, modelsLoading)}
+          </small>
+        </span>
+      </label>
       <label className="include-context-option">
-        <span><strong>Security review</strong><small>Run code review &amp; pentest via AWS Security Agent after validation.</small></span>
+        <span>
+          <strong>Security review</strong>
+          <small>
+            {securityAgentEnabled
+              ? "Run code review & pentest via AWS Security Agent after validation."
+              : "Unavailable: AWS Security Agent was not provisioned (deployed with -c securityAgent=false)."}
+          </small>
+        </span>
         <select
           value={securityMode}
           onChange={(e) => setSecurityMode(e.target.value as "skip" | "scan" | "remediate")}
+          disabled={!securityAgentEnabled}
           style={{ marginLeft: "auto" }}
         >
           <option value="skip">Skip</option>
@@ -234,6 +315,8 @@ function NewRunForm({ onStarted }: { onStarted: (runId: string) => void }) {
       <p className={`model-status ${kiroConfigured ? "configured" : "fallback"}`}>
         {modelsLoading
           ? "Loading models from the AgentCore runtime…"
+          : kiroDiscoveryPending
+            ? "The coding agent is starting (about 30 seconds after idle); Kiro models will appear shortly…"
           : kiroConfigured
             ? `${models.length} Kiro model(s) available for this account.`
             : "Kiro key is not configured. Implementation runs Kiro CLI only and will fail until the key is set."}
@@ -253,10 +336,7 @@ function NewRunForm({ onStarted }: { onStarted: (runId: string) => void }) {
 
 function statusClass(statusValue: unknown): string {
   const status = optionalString(statusValue);
-  if (status === "COMPLETED") return "ok";
-  if (status && ["FAILED", "REJECTED", "NEEDS_HUMAN"].includes(status)) return "bad";
-  if (status && ["AWAITING_APPROVAL", "CANCELLED"].includes(status)) return "warn";
-  return "info";
+  return runStatusTone(status ?? null);
 }
 
 function RunList({
@@ -295,7 +375,7 @@ function RunList({
 }
 
 function Dashboard({ signOut, user }: { signOut?: () => void; user?: { username?: string } }) {
-  const [view, setView] = useState<"runs" | "repository" | "context" | "mcp">("runs");
+  const [view, setView] = useState<"runs" | "repository" | "context" | "mcp" | "settings">("runs");
   const [showGuide, setShowGuide] = useState(false);
   const [inspectRunId, setInspectRunId] = useState<string | undefined>();
   const [runs, setRuns] = useState<Run[]>([]);
@@ -416,6 +496,9 @@ function Dashboard({ signOut, user }: { signOut?: () => void; user?: { username?
           <button className={view === "context" ? "active" : ""} onClick={() => setView("context")}>Context</button>
           <button className={view === "mcp" ? "active" : ""} onClick={() => setView("mcp")}>MCP</button>
           <button className={view === "repository" ? "active" : ""} onClick={() => { setInspectRunId(undefined); setView("repository"); }}>Repository</button>
+          <button className={view === "settings" ? "active" : ""} onClick={() => setView("settings")}>
+            <span aria-hidden="true">⚙</span> Settings
+          </button>
         </nav>
         <div className="header-actions">
           <button className="guide-button" onClick={() => setShowGuide(true)}>
@@ -431,6 +514,8 @@ function Dashboard({ signOut, user }: { signOut?: () => void; user?: { username?
         <ContextTab />
       ) : view === "mcp" ? (
         <McpTab />
+      ) : view === "settings" ? (
+        <SettingsTab />
       ) : view === "repository" ? (
         <RepositoryBrowser initialRunId={inspectRunId} />
       ) : (

@@ -1,0 +1,8 @@
+# Each image needs only its Dockerfile, its lock file and serve.py from this directory.
+# (The CDK construct passes the same per-image allowlist; this file covers local builds.)
+*
+!Dockerfile
+!Dockerfile.gpu
+!requirements.txt
+!requirements-gpu.txt
+!serve.py

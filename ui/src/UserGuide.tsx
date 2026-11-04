@@ -5,6 +5,7 @@ const SECTIONS = [
   { id: "start-run", label: "2. Starting a bug-fix run" },
   { id: "pipeline", label: "3. The pipeline, stage by stage" },
   { id: "approval", label: "4. The human approval gate" },
+  { id: "review", label: "4b. The review gate" },
   { id: "security", label: "5. Security review (AWS Security Agent)" },
   { id: "report", label: "6. Reading the report" },
   { id: "usage", label: "7. Usage & cost breakdown" },
@@ -14,6 +15,7 @@ const SECTIONS = [
   { id: "logs", label: "11. Agent logs" },
   { id: "troubleshooting", label: "12. Troubleshooting & FAQ" },
   { id: "kiro-setup", label: "13. Admin: connecting Kiro CLI" },
+  { id: "decision-model", label: "14. Settings: decision model endpoints" },
 ];
 
 export function UserGuide({ onClose }: { onClose: () => void }) {
@@ -97,9 +99,10 @@ export function UserGuide({ onClose }: { onClose: () => void }) {
                 </dd>
                 <dt>Analysis model</dt>
                 <dd>
-                  The Bedrock model used for triage, drafting, and validation (for
-                  example Claude Haiku, Sonnet, or Opus). This is separate from the
-                  model Kiro uses to write code.
+                  The Bedrock model used for triage and drafting: Claude Haiku 5.5,
+                  Sonnet 5.5 (default) or Opus 5.5. Validation uses its own fixed model so
+                  it stays independent of this choice. This is also separate from the model
+                  Kiro uses to write code.
                 </dd>
                 <dt>Triage guidance</dt>
                 <dd>
@@ -119,6 +122,19 @@ export function UserGuide({ onClose }: { onClose: () => void }) {
                   gate and executes immediately — the auto-approval is recorded in the
                   audit trail. COMPLEX runs always stop and wait for you.
                 </dd>
+                <dt>Decision model second opinion</dt>
+                <dd>
+                  When checked, the <strong>Strands Decider</strong> decision model also
+                  classifies the fix as SIMPLE or COMPLEX right after triage, by answering
+                  five yes/no checks about the bug report. A decision model does not write
+                  text: it picks one of the given answers and returns how likely each one
+                  is. The result is <strong>informative only</strong>. Routing, auto-execution
+                  and the gate recommendation always follow the LLM triage. The run uses the
+                  endpoint picked in ⚙ Settings (CPU or GPU), and the option can be checked
+                  only while that endpoint is running (InService); the line under it shows
+                  which endpoint and its status. Start, stop and pick the endpoints in
+                  ⚙ Settings (section 14).
+                </dd>
                 <dt>Implementation model</dt>
                 <dd>
                   The model Kiro CLI uses to write the code. "Kiro default" lets Kiro
@@ -137,6 +153,37 @@ export function UserGuide({ onClose }: { onClose: () => void }) {
                   reasoning, an estimated file count, and a title.
                 </li>
                 <li>
+                  <strong>DECISION MODEL</strong> (optional) — when the run enabled the
+                  second opinion, the Strands Decider endpoint reads the bug report only
+                  (never the code or the LLM verdict, so the two answers are independent)
+                  and answers five yes/no checks, one per condition of the default triage
+                  guidance: <em>new dependency</em>, <em>data model change</em>,{" "}
+                  <em>API contract change</em>, <em>new component</em>, and{" "}
+                  <em>small edit in fewer than 5 files</em>. The verdict follows from the
+                  checks: SIMPLE when all five pass, COMPLEX when any one fails.
+                  <ul>
+                    <li>
+                      <strong>Each check's "% sure"</strong> is how likely the model thinks
+                      its answer to that check is (50% is a coin toss, 100% is certain).
+                    </li>
+                    <li>
+                      <strong>The verdict's "% likely"</strong> is taken from the check that
+                      decided it: for SIMPLE the least sure passing check, for COMPLEX the
+                      most sure failing check. That check is highlighted.
+                    </li>
+                    <li>
+                      <strong>Certainty</strong>: HIGH at 95% or more, MEDIUM from 75% to
+                      95%, LOW below 75% (a weak hint).
+                    </li>
+                  </ul>
+                  The run page shows it in the purple "Decision model" card beside the LLM
+                  verdict, marked AGREES or DISAGREES, and the execution gate repeats the
+                  verdict, its likelihood and any failing checks. The card also explains how
+                  the model works and can show the exact prompt it read. If the endpoint is
+                  stopped, slow or failing, the card says so and the run continues
+                  unchanged.
+                </li>
+                <li>
                   <strong>DRAFT</strong> — the analysis model produces two candidate
                   artifacts: a Simple prompt (a single precise instruction for Kiro)
                   and a Complex specification (a structured Markdown spec with
@@ -153,15 +200,29 @@ export function UserGuide({ onClose }: { onClose: () => void }) {
                   and pushes the fix branch.
                 </li>
                 <li>
-                  <strong>VALIDATE</strong> — a hard build gate first: if
-                  <code> npm install &amp;&amp; npm run build</code> failed, validation cannot
-                  pass. Then the validator model independently reviews the diff
-                  against the frozen artifact and produces pass/fail checks.
+                  <strong>VALIDATE</strong> — a build gate first, compared with the commit
+                  the run started from. Before Kiro edits anything, the agent builds that
+                  base commit once. The fix passes the build gate when
+                  <code> npm install &amp;&amp; npm run build</code> succeeds, or when the base
+                  commit already failed and the fix adds no new error (for example BUG-002
+                  while BUG-001 still breaks the build). Pre-existing errors are listed on
+                  the run page, never hidden. Then the validator model reviews the diff
+                  against the frozen artifact, even when the build gate failed, and
+                  produces pass/fail checks.
                 </li>
                 <li>
-                  <strong>FIX LOOP</strong> — on validation failure, the findings are
-                  fed back to the agent for another attempt with the same frozen
-                  artifact, up to 3 attempts total.
+                  <strong>FIX LOOP</strong> — on validation failure, the findings are fed
+                  back to the agent for another attempt with the same frozen artifact, up
+                  to 3 attempts. The loop stops early when another attempt cannot change
+                  the result: the same build errors as the previous attempt, or two
+                  attempts in a row with no changes. If Kiro finds the fix already on the
+                  branch from an earlier attempt, that counts as a result, not a failure:
+                  the branch goes to validation again.
+                </li>
+                <li>
+                  <strong>REVIEW</strong> — when the attempts are used up or the loop
+                  stopped early, the run waits in AWAITING_REVIEW for a person to decide
+                  (section 4b).
                 </li>
                 <li>
                   <strong>REPORT</strong> — the final verdict, phases completed, usage
@@ -188,8 +249,9 @@ export function UserGuide({ onClose }: { onClose: () => void }) {
                 </li>
                 <li>
                   <strong>Edit the artifact</strong> — you can modify the drafted prompt
-                  or spec before approving. What you approve is frozen: retries reuse
-                  it unchanged.
+                  or spec before approving. What you approve is frozen: automatic retries
+                  reuse it unchanged. Only a reviewer at the review gate can replace it,
+                  as a new recorded version (section 4b).
                 </li>
                 <li>
                   <strong>Execute or Cancel</strong> — cancel ends the run with an
@@ -201,6 +263,46 @@ export function UserGuide({ onClose }: { onClose: () => void }) {
                 verdict approves the drafted Simple prompt automatically and the run
                 proceeds without pausing. The run history shows it was auto-approved.
                 COMPLEX verdicts always stop for review regardless of the checkbox.
+              </p>
+            </section>
+
+            <section id="guide-review">
+              <h3>4b. The review gate (after failed attempts)</h3>
+              <p>
+                A run that could not reach a green validation on its own stops in
+                AWAITING_REVIEW. The review panel shows why it stopped, the build
+                comparison (errors added by the fix and pre-existing ones), every
+                validator check, the last attempt's summary and a link to the fix branch
+                diff. Any signed-in user can decide:
+              </p>
+              <ul>
+                <li>
+                  <strong>Accept the fix</strong> — keep the fix branch as it is. A
+                  written reason is required. The run continues to security review if it
+                  asked for one and ends as ACCEPTED BY REVIEWER, with your name, your
+                  reason and the failed checks. It is never shown as a green validation.
+                  Accept needs a fix commit; a run whose attempts changed nothing can only
+                  be retried or closed.
+                </li>
+                <li>
+                  <strong>Retry with guidance</strong> — write instructions for Kiro (they
+                  are added to its prompt for every following attempt), choose 1–3 more
+                  attempts, and optionally edit the approved prompt or spec. An edited
+                  artifact is saved as a new approved version; the original stays on the
+                  run. A run allows at most 9 attempts and 3 review rounds; at the third
+                  review only Accept and Close are offered.
+                </li>
+                <li>
+                  <strong>Close the run</strong> — end it without accepting. The run ends
+                  as NEEDS HUMAN and the fix branch is kept.
+                </li>
+              </ul>
+              <p>
+                If nobody decides within 7 days, the run closes on its own. While a run
+                waits for review, the repository reset and fix-branch delete actions are
+                blocked, because the run still uses the base commit and its branch. Every
+                decision is listed under "Review decisions" on the run page and in the
+                timeline.
               </p>
             </section>
 
@@ -240,6 +342,15 @@ export function UserGuide({ onClose }: { onClose: () => void }) {
                   agent for remediation — today it reports them for human review.
                 </dd>
               </dl>
+              <p>
+                The deployment provisions the Security Agent space (<code>adlc-poc</code>), its
+                service role and the UI domain as a verified target domain. If the stack was
+                deployed with <code>-c securityAgent=false</code>, the dropdown is disabled and
+                every run skips the security review. Penetration tests need the domain to be
+                VERIFIED (stack output <code>SecurityAgentDomainVerification</code>); while it
+                is not, the pentest is reported as failed to start and the code review still
+                runs.
+              </p>
               <h4>What runs under the hood</h4>
               <ul>
                 <li>
@@ -331,12 +442,14 @@ export function UserGuide({ onClose }: { onClose: () => void }) {
                   <tr><th>Component</th><th>Typical range</th><th>Notes</th></tr>
                 </thead>
                 <tbody>
-                  <tr><td>Analysis (Haiku)</td><td>$0.01 – $0.05</td><td>Triage + draft calls</td></tr>
-                  <tr><td>Analysis (Sonnet)</td><td>$0.05 – $0.30</td><td>Triage + draft calls</td></tr>
+                  <tr><td>Analysis (Haiku 5.5)</td><td>under $0.01</td><td>Triage + draft calls</td></tr>
+                  <tr><td>Analysis (Sonnet 5.5)</td><td>$0.01 – $0.07</td><td>Triage + draft calls</td></tr>
+                  <tr><td>Analysis (Opus 5.5)</td><td>$0.01 – $0.14</td><td>Triage + draft calls</td></tr>
                   <tr><td>Kiro CLI</td><td>$0.50 – $3.00</td><td>Per attempt, depends on complexity</td></tr>
                   <tr><td>AgentCore runtime</td><td>Included</td><td>Container compute (preview pricing)</td></tr>
                   <tr><td>Code review</td><td>Free</td><td>Static analysis, 15–30 min</td></tr>
                   <tr><td>Pentest</td><td>$250 – $400</td><td>$50/task-hour × 5–8 hours typical</td></tr>
+                  <tr><td>Decision model</td><td>No per-run charge</td><td>Each endpoint is billed per hour while it is running: CPU $0.922/hour, GPU $2.605/hour; start and stop them in ⚙ Settings (section 14)</td></tr>
                 </tbody>
               </table>
               <p className="muted">
@@ -449,13 +562,31 @@ export function UserGuide({ onClose }: { onClose: () => void }) {
                 </dd>
                 <dt>Validation keeps failing</dt>
                 <dd>
-                  After 3 attempts the run ends with the findings preserved. Review
-                  them, refine the bug text or artifact, and start a fresh run.
+                  After 3 attempts, or earlier when another attempt cannot help, the run
+                  waits in AWAITING_REVIEW. Open it and accept the fix with a reason, retry
+                  with guidance, or close it (section 4b). If the build fails only on
+                  errors the base commit already had, the build gate passes and the run
+                  page lists those errors as pre-existing.
                 </dd>
                 <dt>The repository looks already fixed</dt>
                 <dd>
                   Someone merged or edited <code>main</code>. Use "Restore buggy state" on the
                   Repository tab to recreate the canonical seeded bugs.
+                </dd>
+                <dt>The decision model option is greyed out</dt>
+                <dd>
+                  The endpoint the pipeline uses (CPU or GPU, picked in ⚙ Settings) is
+                  stopped (the default) or still starting. Deploy it from ⚙ Settings and wait
+                  for RUNNING, or pick the other endpoint if that one is running; the status
+                  line under the option says which endpoint it checks and its state. See
+                  section 14.
+                </dd>
+                <dt>The decision model disagrees with triage</dt>
+                <dd>
+                  Expected sometimes: it reads only the bug report, not the code. Look at
+                  the highlighted check that decided its verdict and how sure it was, then
+                  look at the artifact more closely at the gate. A LOW-certainty result is
+                  a weak hint. It never changes what the pipeline does.
                 </dd>
                 <dt>MCP server did not start</dt>
                 <dd>
@@ -510,6 +641,86 @@ export function UserGuide({ onClose }: { onClose: () => void }) {
               <p className="muted">
                 Deployment itself (CDK stack, demo user creation, seeding) is covered in
                 the repository README.
+              </p>
+            </section>
+
+            <section id="guide-decision-model">
+              <h3>14. Settings: the decision model endpoints (CPU and GPU)</h3>
+              <p>
+                The second opinion runs on <strong>Strands Decider</strong>
+                (<code>strands-decider-12B-gemma4-v1-2610</code>, Apache-2.0) on a private
+                Amazon SageMaker real-time endpoint. The same model can run on two endpoints:
+              </p>
+              <table className="guide-table">
+                <thead>
+                  <tr><th>Endpoint</th><th>Instance</th><th>Price (us-east-1)</th><th>Answer time</th></tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>CPU, <code>adlc-poc-decider</code></td>
+                    <td><code>ml.m5.4xlarge</code></td>
+                    <td>$0.922/hour (about $22 a day)</td>
+                    <td>About 20 s for a short bug report, 45 s at 2,600 characters; much longer reports can pass SageMaker's 60-second limit</td>
+                  </tr>
+                  <tr>
+                    <td>GPU, <code>adlc-poc-decider-gpu</code></td>
+                    <td><code>ml.g6e.xlarge</code> (one NVIDIA L40S)</td>
+                    <td>$2.605/hour (about $63 a day)</td>
+                    <td>Expected to be a few seconds; not measured yet in this deployment</td>
+                  </tr>
+                </tbody>
+              </table>
+              <p>
+                The stack deploys everything both endpoints need (weights, images, models and
+                endpoint configurations) but <strong>not the endpoints themselves</strong>,
+                because each is billed for every hour it exists, whether or not runs use it.
+              </p>
+              <p>
+                GPU instances are sometimes not available. If a GPU deploy ends in FAILED with
+                "InsufficientInstanceCapacity", AWS had no free <code>ml.g6e.xlarge</code> at that
+                moment: stop (delete) the failed endpoint and deploy it again later. SageMaker
+                bills instance time, and a start that failed for lack of capacity never got an
+                instance.
+              </p>
+              <ol>
+                <li>
+                  <strong>Pick the endpoint the pipeline uses</strong> — the "Endpoint used by
+                  the pipeline" panel at the top of ⚙ Settings chooses CPU or GPU (CPU by
+                  default). Both endpoints can be running, but a run calls only the one picked
+                  here. The choice is recorded on each run when it starts, so changing it does
+                  not affect runs already in progress, and the run page shows which endpoint
+                  answered. The panel warns when the picked endpoint is not running, and when
+                  the other one is running and billed without being used.
+                </li>
+                <li>
+                  <strong>Check an endpoint</strong> — each endpoint has its own panel with the
+                  status (STOPPED, STARTING, RUNNING, STOPPING, FAILED), instance type, hourly
+                  price, how long it has been running and an estimated cost so far. The page
+                  refreshes every 10 seconds while an endpoint is changing.
+                </li>
+                <li>
+                  <strong>Deploy</strong> — creates that endpoint from its endpoint
+                  configuration after you confirm the cost. Startup takes about 10 minutes; the
+                  run-form option becomes available once the endpoint the pipeline uses is
+                  RUNNING (InService).
+                </li>
+                <li>
+                  <strong>Stop (delete)</strong> — deletes that endpoint and ends its billing.
+                  The configuration and weights stay, so Deploy works again later. If it is the
+                  endpoint the pipeline uses, runs that ask for a second opinion meanwhile
+                  record it as unavailable and continue.
+                </li>
+              </ol>
+              <p>
+                Any signed-in user can see the status, use Deploy and Stop, and change which
+                endpoint the pipeline uses. Every change is recorded in the audit table with
+                who made it. If the stack is updated in a way that replaces an endpoint
+                configuration, a running endpoint keeps the old one and its panel says so;
+                stop it and deploy again. Deleting the stack also deletes both endpoints.
+              </p>
+              <p className="muted">
+                Access is IAM-only: just the decision-model step can call the endpoints, and
+                the model containers run with network isolation.
               </p>
             </section>
           </div>

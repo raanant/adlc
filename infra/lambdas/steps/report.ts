@@ -1,9 +1,16 @@
-import { appendEvent, getRun, updateRun } from "../shared/db";
+import { appendEvent, getRun, removeField, updateRun } from "../shared/db";
+import { REVIEW_TIMEOUT_DAYS } from "../shared/review";
 
 type Mode =
   | "success"
+  /** A reviewer accepted the fix without a green validation (set from "success", see below). */
+  | "accepted"
   | "complex"
   | "needsHuman"
+  /** A reviewer closed the run at the review gate. */
+  | "reviewClosed"
+  /** Nobody decided at the review gate within REVIEW_TIMEOUT_DAYS. */
+  | "reviewTimeout"
   | "rejected"
   | "cancelled"
   | "failed";
@@ -32,8 +39,11 @@ type UsageAttempt = {
 
 const STATUS_BY_MODE: Record<Mode, string> = {
   success: "COMPLETED",
+  accepted: "ACCEPTED_BY_REVIEWER",
   complex: "COMPLEX_DECISION",
   needsHuman: "NEEDS_HUMAN",
+  reviewClosed: "NEEDS_HUMAN",
+  reviewTimeout: "NEEDS_HUMAN",
   rejected: "REJECTED",
   cancelled: "CANCELLED",
   failed: "FAILED",
@@ -41,10 +51,14 @@ const STATUS_BY_MODE: Record<Mode, string> = {
 
 const HEADLINE_BY_MODE: Record<Mode, string> = {
   success: "Fix implemented, validated, and pushed. Run complete.",
+  accepted:
+    "A reviewer accepted the fix without a green validation. The fix branch is pushed; the failed checks are recorded.",
   complex:
     "Triage classified this bug as COMPLEX. Per PoC scope, the Complex path is recorded as a decision outcome without execution.",
   needsHuman:
     "Maximum fix/re-validate cycles reached without a green validation. The run is handed back to a human.",
+  reviewClosed: "A reviewer closed the run at the review gate. The fix branch is kept for inspection.",
+  reviewTimeout: `Nobody decided at the review gate within ${REVIEW_TIMEOUT_DAYS} days, so the run was closed. The fix branch is kept.`,
   rejected:
     "The reviewer rejected the draft the maximum number of times. Run closed without code changes.",
   cancelled: "The run was cancelled at the execution gate. No implementation was started.",
@@ -173,9 +187,27 @@ export const handler = async (event: {
   error?: { Error?: unknown; Cause?: unknown };
   failureStage?: unknown;
 }): Promise<Record<string, unknown>> => {
-  const { runId, mode } = event;
-  const run = (await getRun(runId)) ?? {};
+  const run = (await getRun(event.runId)) ?? {};
+  const { runId } = event;
+  // An accepted fix goes through the same security-review path as a validated one and reaches
+  // the "success" report; the run record says whether a reviewer accepted it.
+  const mode: Mode =
+    event.mode === "success" && run.reviewOutcome === "accepted" ? "accepted" : event.mode;
+  if (mode === "reviewTimeout") {
+    await removeField(runId, "taskToken");
+    await removeField(runId, "review");
+  }
   const failure = parseFailure(event.error, event.failureStage);
+  const reviewDecisions = (Array.isArray(run.reviewDecisions) ? run.reviewDecisions : [])
+    .map((d) => asRecord(d))
+    .filter((d): d is Record<string, unknown> => d !== null);
+  const lastDecision = reviewDecisions[reviewDecisions.length - 1];
+  const decisionNote =
+    lastDecision && (mode === "accepted" || mode === "reviewClosed")
+      ? ` Decided by ${stringValue(lastDecision.reviewer) ?? "a reviewer"}${
+          stringValue(lastDecision.reason) ? `: "${String(lastDecision.reason).slice(0, 300)}"` : ""
+        }.`
+      : "";
 
   const createdAt = stringValue(run.createdAt);
   const createdAtMillis = createdAt ? new Date(createdAt).getTime() : Number.NaN;
@@ -439,7 +471,21 @@ export const handler = async (event: {
       },
     },
     ...(failure ? { failure } : {}),
+    ...(reviewDecisions.length > 0 || mode === "reviewTimeout"
+      ? {
+          review: {
+            outcome:
+              mode === "accepted" ? "ACCEPTED" : mode === "reviewClosed" ? "CLOSED" : mode === "reviewTimeout" ? "TIMED_OUT" : "RETRIED",
+            rounds: reviewDecisions.length,
+            decidedBy: stringValue(lastDecision?.reviewer),
+            reason: stringValue(lastDecision?.reason),
+            failedChecks: Array.isArray(lastDecision?.failedChecks) ? lastDecision.failedChecks : [],
+            validationPassed: asRecord(run.validation)?.pass === true,
+          },
+        }
+      : {}),
   };
+  report.headline = `${report.headline}${decisionNote}`;
 
   await updateRun(runId, { status: STATUS_BY_MODE[mode], report });
   const failureMessage = failure
@@ -450,7 +496,7 @@ export const handler = async (event: {
   await appendEvent(
     runId,
     "REPORT",
-    `${HEADLINE_BY_MODE[mode]}${failureMessage} Time: ${totalSeconds}s, cost: $${report.totalCostUsd}, tasks: ${report.tasksCompleted}, fix loops: ${report.fixLoops}`
+    `${report.headline}${failureMessage} Time: ${totalSeconds}s, cost: $${report.totalCostUsd}, tasks: ${report.tasksCompleted}, fix loops: ${report.fixLoops}`
   );
   return report;
 };

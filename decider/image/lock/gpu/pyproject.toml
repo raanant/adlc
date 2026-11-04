@@ -1,0 +1,15 @@
+[project]
+name = "adlc-poc-decider-image-gpu"
+version = "0.0.0"
+requires-python = "==3.11.*"
+dependencies = [
+  "strands-decider==0.2.0",
+  "torch==2.7.1+cu126",
+  "transformers==5.19.0",
+]
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
