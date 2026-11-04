@@ -8,7 +8,7 @@ import {
   safeObjectArray,
   safeRecord,
   safeString,
-  safeTime,
+  safeDateTime,
 } from "./safe";
 
 /** Mirrors infra/lambdas/shared/review.ts. */
@@ -188,7 +188,7 @@ export function ReviewPanel({
       </div>
       <p>{safeString(review?.reason, "Automatic attempts could not finish this run.")}</p>
       <p className="muted small">
-        If nobody decides, the run closes on its own on {safeTime(review?.expiresAt)}.
+        If nobody decides, the run closes on its own on {safeDateTime(review?.expiresAt)}.
       </p>
 
       <ReviewEvidence run={run} onInspectFix={onInspectFix} />
@@ -336,7 +336,7 @@ export function ReviewHistory({ run }: { run: Run }) {
                 Round {safeNonNegativeNumber(d.round) ?? i + 1}: {ACTION_LABEL[safeString(d.action, "")] ?? safeString(d.action)}
               </strong>{" "}
               <span className="muted small">
-                by {safeString(d.reviewer, "a reviewer")} · {safeTime(d.decidedAt)} · after{" "}
+                by {safeString(d.reviewer, "a reviewer")} · {safeDateTime(d.decidedAt)} · after{" "}
                 {safeNonNegativeNumber(d.attemptsAtDecision) ?? "?"} attempt(s)
               </span>
               {optionalString(d.reason) && <p>“{safeString(d.reason)}”</p>}

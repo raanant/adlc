@@ -57,6 +57,16 @@ export function safeLowerClass(value: unknown, fallback = "unknown"): string {
     : fallback;
 }
 
+/** Date and time, for moments that are not today (e.g. a review deadline a week away). */
+export function safeDateTime(value: unknown): string {
+  const text = optionalString(value);
+  if (!text) return "Unavailable";
+  const date = new Date(text);
+  return Number.isNaN(date.getTime())
+    ? "Unavailable"
+    : date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+}
+
 export function displayStatus(value: unknown): string {
   const text = optionalString(value);
   return text ? text.replace(/_/g, " ") : "Unavailable";
