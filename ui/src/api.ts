@@ -5,7 +5,10 @@ import type {
   ContextListResponse,
   ContextPreview,
   ContextUploadReservation,
+  DeciderOverview,
+  DeciderVariantId,
   ExecutionMode,
+  ReviewAction,
   McpConfigResponse,
   ModelsResponse,
   RepositoryFile,
@@ -76,6 +79,17 @@ export const api = {
         body: JSON.stringify({ action, mode, artifact, feedback }),
       }
     ),
+  reviewDecision: (
+    runId: string,
+    decision:
+      | { action: "accept"; reason: string }
+      | { action: "retry"; guidance: string; additionalAttempts: number; artifact?: string }
+      | { action: "close"; reason?: string }
+  ) =>
+    request<{ ok: boolean; action: ReviewAction; round: number }>(`/runs/${runId}/review-decision`, {
+      method: "POST",
+      body: JSON.stringify(decision),
+    }),
   repositoryRefs: () => request<RepositoryRefsResponse>("/repository/refs"),
   repositoryTree: (ref: string, path = "") =>
     request<RepositoryTreeResponse>(
@@ -107,6 +121,32 @@ export const api = {
     }>(`/repository/fix-branches/${runId}`, {
       method: "DELETE",
       body: JSON.stringify({ confirmation, expectedCommitId }),
+    }),
+  getDeciderEndpoints: () => request<DeciderOverview>("/decision-model/endpoint"),
+  updateRunModel: (runId: string, kiroModel: string) =>
+    request<{ ok: boolean; kiroModel: string; previousModel: string }>(
+      `/runs/${runId}/model`,
+      { method: "POST", body: JSON.stringify({ kiroModel }) }
+    ),
+  securityDecision: (runId: string, action: "accept" | "remediate", feedback?: string) =>
+    request<{ ok: boolean; action: string }>(
+      `/runs/${runId}/security-decision`,
+      { method: "POST", body: JSON.stringify({ action, feedback }) }
+    ),
+  deployDeciderEndpoint: (variant: DeciderVariantId) =>
+    request<DeciderOverview & { actionId: string }>("/decision-model/endpoint", {
+      method: "POST",
+      body: JSON.stringify({ action: "deploy", variant, acknowledgeHourlyCost: true }),
+    }),
+  stopDeciderEndpoint: (variant: DeciderVariantId) =>
+    request<DeciderOverview & { actionId: string }>("/decision-model/endpoint", {
+      method: "POST",
+      body: JSON.stringify({ action: "stop", variant }),
+    }),
+  selectDeciderVariant: (variant: DeciderVariantId) =>
+    request<DeciderOverview & { actionId: string }>("/decision-model/endpoint", {
+      method: "POST",
+      body: JSON.stringify({ action: "select", variant }),
     }),
   getMcpConfig: () => request<McpConfigResponse>("/mcp/config"),
   saveMcpConfig: (configJson: string) =>

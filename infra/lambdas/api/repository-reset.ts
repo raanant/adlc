@@ -154,6 +154,10 @@ const ACTIVE_STATUSES = new Set([
   "AWAITING_APPROVAL",
   "IMPLEMENTING",
   "VALIDATING",
+  // Review gate: the run still uses the base commit and its fix branch.
+  "AWAITING_REVIEW",
+  "ACCEPTING",
+  "CLOSING",
 ]);
 
 async function getActiveRuns(): Promise<Array<{ runId: string; status: string }>> {

@@ -25,16 +25,72 @@ export interface McpConfigResponse {
   enabledCount: number;
   maxBytes?: number;
 }
+/** The decision model's endpoint variants: the same model on a CPU or on a GPU instance. */
+export type DeciderVariantId = "cpu" | "gpu";
+
+/** Availability of the decider endpoint picked in Settings, for the run form. */
+export interface DecisionModelStatus {
+  available: boolean;
+  variant: DeciderVariantId | null;
+  label: string;
+  instanceType: string;
+  /** SageMaker EndpointStatus, or NOT_DEPLOYED / NOT_CONFIGURED / UNKNOWN. */
+  status: string;
+  endpointName: string;
+  modelId: string;
+}
+
+/** GET/POST /decision-model/endpoint: both decider endpoints and the one the pipeline uses. */
+export interface DeciderOverview {
+  activeVariant: DeciderVariantId;
+  activeVariantUpdatedAt: string | null;
+  activeVariantUpdatedBy: string | null;
+  canSelect: boolean;
+  variants: DeciderEndpointStatus[];
+}
+
+/** One on-demand decider endpoint (CPU or GPU), for the Settings tab. */
+export interface DeciderEndpointStatus {
+  variant: DeciderVariantId;
+  label: string;
+  /** True for the endpoint the pipeline uses. */
+  active: boolean;
+  endpointName: string;
+  /** NOT_DEPLOYED, UNKNOWN, or a SageMaker EndpointStatus such as Creating or InService. */
+  state: string;
+  serving: boolean;
+  transitional: boolean;
+  endpointConfigName: string;
+  deployedEndpointConfigName: string | null;
+  outOfDate: boolean;
+  instanceType: string;
+  modelId: string;
+  hourlyUsd: number | null;
+  creationTime: string | null;
+  lastModifiedTime: string | null;
+  runningHours: number | null;
+  estimatedCostUsd: number | null;
+  failureReason: string | null;
+  canManage: boolean;
+  canDeploy: boolean;
+  canStop: boolean;
+}
+
 export interface ModelsResponse {
   kiroConfigured: boolean;
   models: ModelOption[];
   analysisModels: ModelOption[];
   defaultAnalysisModel: string;
   defaultTriageInstruction: string;
+  decisionModel?: DecisionModelStatus;
+  /** enabled is false when the stack was deployed with -c securityAgent=false. */
+  securityAgent?: { enabled: boolean };
   error?: string;
 }
 
 export type ExecutionMode = "SIMPLE" | "COMPLEX";
+
+export type TriageMode = "llm" | "both";
 
 export interface StartRunRequest {
   bugText: string;
@@ -44,6 +100,9 @@ export interface StartRunRequest {
   includeContext: boolean;
   autoExecuteSimple: boolean;
   securityMode: "skip" | "scan" | "remediate";
+  triageMode: TriageMode;
+  /** @deprecated Use triageMode instead. Kept for Step Function backward compatibility. */
+  decisionModelEnabled: boolean;
 }
 
 export interface Draft {
@@ -62,6 +121,73 @@ export interface Triage {
   estimatedFiles: number;
   bugId: string;
   title: string;
+  recommendedModel?: string;
+  alternativeModel?: string;
+  modelReasoning?: string;
+}
+
+/**
+ * The decision model's informative second opinion on triage. It is recorded and displayed only;
+ * routing always follows the LLM triage verdict.
+ */
+export interface DecisionModelResult {
+  status: "RUNNING" | "COMPLETED" | "FAILED" | "UNAVAILABLE";
+  provider?: string;
+  /** The endpoint variant the run used (picked in Settings); absent on older runs (CPU). */
+  variant?: DeciderVariantId | null;
+  variantLabel?: string | null;
+  instanceType?: string | null;
+  endpointName?: string;
+  advisoryOnly?: boolean;
+  llmVerdict?: ExecutionMode | null;
+  verdict?: ExecutionMode;
+  /** How likely the verdict is (0.5 to 1): the weakest pass, or the strongest failing check. */
+  probability?: number;
+  certainty?: "HIGH" | "MEDIUM" | "LOW";
+  checks?: Array<{
+    id: string;
+    label: string;
+    /** Probability the model gives to "true". */
+    pTrue: number;
+    /** Probability that this check keeps the fix SIMPLE. */
+    pSimple: number;
+    passes: boolean;
+    text: string;
+  }>;
+  /** The check that decided the verdict. */
+  decidingCheck?: string;
+  /** The exact prompt text the model read, and the request body sent to the endpoint. */
+  prompt?: {
+    stateBlock: string;
+    questions: Array<{ id: string; label: string; block: string }>;
+    request: unknown;
+  };
+  /** Legacy (runs before the five checks): probabilities of one broad SIMPLE/COMPLEX question. */
+  probabilities?: Record<ExecutionMode, number>;
+  /** Legacy: |P(SIMPLE) - P(COMPLEX)|. */
+  confidence?: number;
+  /** Legacy. */
+  confidenceBand?: "HIGH" | "MEDIUM" | "LOW";
+  agreesWithLlm?: boolean | null;
+  modelId?: string;
+  inputTokens?: number | null;
+  serverLatencyMs?: number | null;
+  roundTripMs?: number;
+  input?: { stateChars: number; bugReportChars: number; bugReportTruncated: boolean };
+  error?: { code: string; message: string };
+  startedAt?: string;
+  completedAt?: string;
+}
+
+export type BuildVerdict = "PASSED" | "PRE_EXISTING_ONLY" | "NEW_ERRORS" | "FAILED_UNCOMPARABLE";
+
+export interface BuildGate {
+  verdict: BuildVerdict;
+  ok: boolean;
+  newErrors: string[];
+  preExistingErrors: string[];
+  fixedErrors: string[];
+  baselineOk: boolean | null;
 }
 
 export interface Validation {
@@ -69,6 +195,42 @@ export interface Validation {
   checks: Array<{ requirement: string; pass: boolean; note: string }>;
   issues: string[];
   fixAttempts: number;
+  /** False when another automatic attempt could not change the outcome. */
+  retryable?: boolean;
+  stopReason?: string;
+  buildGate?: BuildGate;
+  noChanges?: boolean;
+  modelReviewed?: boolean;
+}
+
+/** The review gate while a run waits for a person (status AWAITING_REVIEW). */
+export interface ReviewState {
+  round: number;
+  openedAt: string;
+  expiresAt: string;
+  reason: string;
+  attemptsUsed: number;
+  attemptBudget: number;
+  canRetry: boolean;
+  retryUnavailableReason?: string;
+  maxAdditionalAttempts: number;
+}
+
+export type ReviewAction = "accept" | "retry" | "close";
+
+export interface ReviewDecisionRecord {
+  round: number;
+  action: ReviewAction;
+  reason?: string;
+  guidance?: string;
+  additionalAttempts?: number;
+  attemptBudget?: number;
+  artifactVersion?: number;
+  artifactEdited?: boolean;
+  reviewer: string;
+  decidedAt: string;
+  failedChecks: string[];
+  attemptsAtDecision: number;
 }
 
 export type UsageStatus =
@@ -141,6 +303,14 @@ export interface Report {
     message?: string;
     retryable?: boolean;
   };
+  review?: {
+    outcome: "ACCEPTED" | "CLOSED" | "TIMED_OUT" | "RETRIED";
+    rounds: number;
+    decidedBy: string | null;
+    reason: string | null;
+    failedChecks: string[];
+    validationPassed: boolean;
+  };
 }
 
 export interface Run {
@@ -153,6 +323,8 @@ export interface Run {
   includeContext?: boolean;
   autoExecuteSimple?: boolean;
   securityMode?: string;
+  decisionModelEnabled?: boolean;
+  decisionModel?: DecisionModelResult;
   workflowVersion?: number;
   contextAudit?: {
     enabled: boolean;
@@ -202,9 +374,28 @@ export interface Run {
     agentCoreUsageStatus?: UsageStatus;
     agentCoreUsageSource?: string;
     error?: string;
+    noNewChanges?: boolean;
+    buildErrors?: string[];
   };
   fixBranch?: string;
+  fixCommitId?: string;
+  baseCommitId?: string;
+  approvedArtifact?: string;
+  fixAttempts?: number;
+  /** Implementation attempts allowed before the next review (3, raised by a retry decision). */
+  attemptBudget?: number;
+  review?: ReviewState;
+  reviewDecisions?: ReviewDecisionRecord[];
+  reviewOutcome?: "accepted" | "closed";
+  artifactVersions?: Array<{ version: number; artifact: string; createdBy: string; createdAt: string; source: string }>;
+  baselineBuild?: { ok: boolean; errors: string[]; commitId?: string };
   securityReview?: SecurityReview;
+  securityDecision?: {
+    action: "accept" | "remediate";
+    feedback?: string;
+    reviewer?: string;
+    decidedAt?: string;
+  };
 }
 
 export interface SecurityReview {
@@ -220,6 +411,8 @@ export interface SecurityReview {
     confidence: string;
     status: string;
     findingId: string;
+    remediation?: string;
+    description?: string;
   }>;
   codeReviewId?: string;
   codeReviewJobId?: string;

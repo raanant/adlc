@@ -22,12 +22,29 @@ import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import * as sfn from "aws-cdk-lib/aws-stepfunctions";
 import * as tasks from "aws-cdk-lib/aws-stepfunctions-tasks";
+import { DECIDER_MODEL } from "./decider-config";
+import { ANALYSIS_MODELS } from "../lambdas/shared/workflow";
+import { DecisionModel, deciderVariantsEnv } from "./decision-model";
+import { INITIAL_ATTEMPT_BUDGET, REVIEW_TIMEOUT_DAYS } from "../lambdas/shared/review";
+import {
+  SECURITY_AGENT_VERIFICATION_ROUTE,
+  SECURITY_REVIEW_PREFIX,
+  SecurityAgent,
+} from "./security-agent";
+
+/** Read a boolean CDK context value: `-c key=false` arrives as a string. */
+function contextFlag(value: unknown, fallback: boolean): boolean {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (value === true || value === "true") return true;
+  if (value === false || value === "false") return false;
+  throw new Error(`context value must be true or false, got ${String(value)}`);
+}
 
 const BASE_BRANCH = "main";
-// Independent validation uses Sonnet and remains separate from the selected
-// implementation engine (Kiro CLI or its Haiku fallback).
-const VALIDATE_MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
-const MAX_FIX_LOOPS = 3;
+// Independent validation uses a fixed Sonnet model, separate from the analysis model chosen on
+// the start form and from the implementation engine (Kiro CLI or its Haiku fallback).
+const VALIDATE_MODEL_ID = "us.anthropic.claude-sonnet-5-5";
+
 const KIRO_KEY_SECRET_NAME = "adlc-poc/kiro-api-key";
 
 export class AdlcPocStack extends cdk.Stack {
@@ -78,6 +95,15 @@ export class AdlcPocStack extends cdk.Stack {
     });
     const resetAuditTable = new dynamodb.Table(this, "ResetAuditTable", {
       partitionKey: { name: "actionId", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      encryption: dynamodb.TableEncryption.AWS_MANAGED,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+      removalPolicy: cdk.RemovalPolicy.DESTROY, // PoC only
+    });
+    // Deployment-wide settings changed from the Settings tab (today: which decision-model
+    // endpoint the pipeline uses). One item per setting; a missing item means the default.
+    const settingsTable = new dynamodb.Table(this, "SettingsTable", {
+      partitionKey: { name: "settingKey", type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       encryption: dynamodb.TableEncryption.AWS_MANAGED,
       pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
@@ -210,6 +236,14 @@ export class AdlcPocStack extends cdk.Stack {
         KIRO_KEY_SECRET_ARN: kiroKeySecret.secretArn,
       },
     });
+    // AgentCore Runtime platform V2: a session starts by restoring a snapshot taken after
+    // agent/app.py's start-up (imports and constants only), instead of booting the container, so
+    // cold starts are short and steady, and memory is billed by use. app.py keeps per-request
+    // work (AWS clients, credentials, temp dirs, timestamps, Kiro CLI processes) in the handler,
+    // as V2 requires. CloudFormation supports PlatformVersion; aws-cdk-lib 2.220's typed
+    // CfnRuntime props do not (later releases add `platformVersion`), hence the override.
+    // Roll back by setting "V1".
+    agentRuntime.addPropertyOverride("PlatformVersion", "V2");
     // CfnRuntime references only the role ARN, so CloudFormation otherwise has
     // no dependency on the separately generated inline policy and may validate
     // ECR access before that policy is attached.
@@ -251,8 +285,19 @@ export class AdlcPocStack extends cdk.Stack {
       memory: 1024,
     });
     const draftFn = stepFn("DraftFn", "draft.ts");
+    // Optional informative second opinion from the Strands Decider decision model, on a CPU or a
+    // GPU endpoint. The stack holds everything but the billed endpoints, which are deployed and
+    // stopped from Settings; Settings also picks the one the pipeline uses. The step records its
+    // answer and never changes routing.
+    const decider = new DecisionModel(this, "DecisionModelHosting");
+    const DECIDER_VARIANTS = deciderVariantsEnv(decider.variants);
+    const decisionModelFn = stepFn("DecisionModelFn", "decision-model.ts", {
+      env: { DECIDER_VARIANTS },
+      timeout: cdk.Duration.seconds(90),
+    });
     const autoDecisionFn = stepFn("AutoDecisionFn", "auto-decision.ts");
     const awaitApprovalFn = stepFn("AwaitApprovalFn", "await-approval.ts");
+    const awaitReviewFn = stepFn("AwaitReviewFn", "await-review.ts");
     const implementFn = stepFn("ImplementFn", "implement.ts", {
       env: { AGENT_RUNTIME_ARN: agentRuntime.attrAgentRuntimeArn },
       timeout: cdk.Duration.minutes(15),
@@ -262,6 +307,7 @@ export class AdlcPocStack extends cdk.Stack {
       env: { VALIDATE_MODEL_ID },
     });
     const reportFn = stepFn("ReportFn", "report.ts");
+    const awaitSecurityGateFn = stepFn("AwaitSecurityGateFn", "await-security-gate.ts");
     const securityStartFn = stepFn("SecurityStartFn", "security-review-start.ts", {
       timeout: cdk.Duration.minutes(5),
       memory: 1024,
@@ -269,32 +315,50 @@ export class AdlcPocStack extends cdk.Stack {
     const securityCheckFn = stepFn("SecurityCheckFn", "security-review-check.ts", {
       timeout: cdk.Duration.minutes(2),
     });
-    for (const fn of [securityStartFn, securityCheckFn]) {
-      fn.addEnvironment("AGENT_SPACE_ID", "as-6b6ad79c-b406-4765-aa20-7e8a904e6f9e");
-      fn.addToRolePolicy(new iam.PolicyStatement({
-        actions: ["securityagent:*"],
-        resources: ["*"],
-      }));
-    }
-    securityStartFn.addEnvironment("SERVICE_ROLE_ARN", `arn:aws:iam::${this.account}:role/service-role/security-testing-20260914113135`);
+    // AWS Security Agent (agent space, service role, verified target domain) is provisioned by
+    // this stack after the CloudFront distribution exists (see "Security review" below).
+    // Opt out with: cdk deploy -c securityAgent=false
+    const securityAgentEnabled = contextFlag(this.node.tryGetContext("securityAgent"), true);
     securityStartFn.addEnvironment("CONTEXT_BUCKET", contextBucket.bucketName);
-    contextBucket.grantReadWrite(securityStartFn);
+    // Writes the source archive to security-review/ only.
+    securityStartFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ["s3:PutObject"],
+      resources: [contextBucket.arnForObjects(`${SECURITY_REVIEW_PREFIX}*`)],
+    }));
     repo.grantRead(securityStartFn);
-    // APP_ENDPOINT set after CloudFront distribution is created (see below)
 
-    for (const fn of [triageFn, draftFn, autoDecisionFn, awaitApprovalFn, implementFn, validateFn, reportFn, securityStartFn, securityCheckFn]) {
+    for (const fn of [triageFn, draftFn, autoDecisionFn, awaitApprovalFn, awaitReviewFn, implementFn, validateFn, reportFn, securityStartFn, securityCheckFn, awaitSecurityGateFn]) {
       runsTable.grantReadWriteData(fn);
     }
-    const bedrockInvoke = new iam.PolicyStatement({
-      actions: ["bedrock:InvokeModel"],
-      resources: [
-        `arn:aws:bedrock:*::foundation-model/anthropic.*`,
-        `arn:aws:bedrock:${this.region}:${this.account}:inference-profile/us.anthropic.*`,
-      ],
-    });
-    triageFn.addToRolePolicy(bedrockInvoke);
-    draftFn.addToRolePolicy(bedrockInvoke);
-    validateFn.addToRolePolicy(bedrockInvoke);
+    // Bedrock access, limited to the models each function uses. A US cross-Region inference
+    // profile is authorized on the profile itself and on its foundation model in every Region it
+    // routes to; the foundation-model grant only applies through the profile.
+    const invokeThroughProfiles = (profileIds: readonly string[]) => {
+      const profileArns = profileIds.map(
+        (id) => `arn:aws:bedrock:${this.region}:${this.account}:inference-profile/${id}`
+      );
+      return [
+        new iam.PolicyStatement({
+          actions: ["bedrock:InvokeModel"],
+          resources: profileArns,
+        }),
+        new iam.PolicyStatement({
+          actions: ["bedrock:InvokeModel"],
+          resources: profileIds.map(
+            (id) => `arn:aws:bedrock:*::foundation-model/${id.replace(/^us\./, "")}`
+          ),
+          conditions: { StringEquals: { "bedrock:InferenceProfileArn": profileArns } },
+        }),
+      ];
+    };
+    const analysisModelIds = ANALYSIS_MODELS.map((model) => model.id);
+    for (const statement of invokeThroughProfiles(analysisModelIds)) {
+      triageFn.addToRolePolicy(statement);
+      draftFn.addToRolePolicy(statement);
+    }
+    for (const statement of invokeThroughProfiles([VALIDATE_MODEL_ID])) {
+      validateFn.addToRolePolicy(statement);
+    }
     repo.grantRead(triageFn);
     triageFn.addToRolePolicy(
       new iam.PolicyStatement({
@@ -306,6 +370,21 @@ export class AdlcPocStack extends cdk.Stack {
       new iam.PolicyStatement({
         actions: ["s3:GetObject"],
         resources: [`${contextBucket.bucketArn}/users/*`],
+      })
+    );
+    // Decision-model step: least privilege. It only updates the run record and invokes the
+    // decider endpoints (the run's variant picks one); the bug report, the variant and the LLM
+    // verdict arrive in the state input.
+    decisionModelFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["dynamodb:UpdateItem"],
+        resources: [runsTable.tableArn],
+      })
+    );
+    decisionModelFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["sagemaker:InvokeEndpoint"],
+        resources: decider.endpointArns,
       })
     );
     repo.grantRead(draftFn);
@@ -342,6 +421,19 @@ export class AdlcPocStack extends cdk.Stack {
       payloadResponseOnly: true,
       retryOnServiceExceptions: false,
       resultPath: "$.triage",
+    });
+
+    const decisionModel = new tasks.LambdaInvoke(this, "DecisionModel", {
+      lambdaFunction: decisionModelFn,
+      payload: sfn.TaskInput.fromObject({
+        "runId.$": "$.runId",
+        "bugText.$": "$.bugText",
+        "variant.$": "$.decisionModelVariant",
+        "triage.$": "$.triage",
+      }),
+      payloadResponseOnly: true,
+      retryOnServiceExceptions: false,
+      resultPath: "$.decisionModel",
     });
 
     const draft = new tasks.LambdaInvoke(this, "Draft", {
@@ -397,6 +489,27 @@ export class AdlcPocStack extends cdk.Stack {
       result: sfn.Result.fromObject({ issues: [] }),
       resultPath: "$.validation",
     });
+    // Automatic implementation attempts before the review gate; "retry with guidance" raises it.
+    const seedAttemptBudget = new sfn.Pass(this, "SeedAttemptBudget", {
+      result: sfn.Result.fromObject({ attemptBudget: INITIAL_ATTEMPT_BUDGET }),
+      resultPath: "$.budget",
+    });
+
+    // Review gate: when automatic attempts cannot finish the run, it waits for a person to
+    // accept the fix (with a reason), retry with guidance, or close it
+    // (POST /runs/{runId}/review-decision, lambdas/api/review-decision.ts).
+    const awaitReview = new tasks.LambdaInvoke(this, "AwaitReview", {
+      lambdaFunction: awaitReviewFn,
+      integrationPattern: sfn.IntegrationPattern.WAIT_FOR_TASK_TOKEN,
+      payload: sfn.TaskInput.fromObject({
+        "runId.$": "$.runId",
+        taskToken: sfn.JsonPath.taskToken,
+        "validation.$": "$.validation",
+        "budget.$": "$.budget",
+      }),
+      resultPath: "$.review",
+      taskTimeout: sfn.Timeout.duration(cdk.Duration.days(REVIEW_TIMEOUT_DAYS)),
+    });
 
     const validate = new tasks.LambdaInvoke(this, "Validate", {
       lambdaFunction: validateFn,
@@ -424,7 +537,8 @@ export class AdlcPocStack extends cdk.Stack {
       });
 
     const reportSuccess = reportTask("ReportSuccess", "success");
-    const reportNeedsHuman = reportTask("ReportNeedsHuman", "needsHuman");
+    const reportReviewClosed = reportTask("ReportReviewClosed", "reviewClosed");
+    const reportReviewTimeout = reportTask("ReportReviewTimeout", "reviewTimeout");
     const reportCancelled = reportTask("ReportCancelled", "cancelled");
 
     const reportFailed = new tasks.LambdaInvoke(this, "ReportFailed", {
@@ -446,7 +560,7 @@ export class AdlcPocStack extends cdk.Stack {
       "Lambda.SdkClientException",
       "Lambda.TooManyRequestsException",
     ];
-    for (const task of [triage, draft, validate]) {
+    for (const task of [triage, decisionModel, draft, validate]) {
       task.addRetry({
         errors: transientLambdaErrors,
         interval: cdk.Duration.seconds(2),
@@ -467,7 +581,7 @@ export class AdlcPocStack extends cdk.Stack {
           sfn.Condition.stringEquals("$.approval.action", "execute"),
           sfn.Condition.booleanEquals("$.approval.approved", true)
         ),
-        seedValidation.next(implement)
+        sfn.Chain.start(seedValidation).next(seedAttemptBudget).next(implement)
       )
       .otherwise(reportCancelled);
 
@@ -527,8 +641,50 @@ export class AdlcPocStack extends cdk.Stack {
       maxAttempts: 3,
     });
 
+    // Security Gate: human decides whether to remediate findings or accept risks
+    const awaitSecurityGate = new tasks.LambdaInvoke(this, "AwaitSecurityGate", {
+      lambdaFunction: awaitSecurityGateFn,
+      integrationPattern: sfn.IntegrationPattern.WAIT_FOR_TASK_TOKEN,
+      payload: sfn.TaskInput.fromObject({
+        "runId.$": "$.runId",
+        taskToken: sfn.JsonPath.taskToken,
+        "securityStart.$": "$.securityStart",
+      }),
+      resultPath: "$.securityDecision",
+      taskTimeout: sfn.Timeout.duration(cdk.Duration.hours(24)),
+    });
+
+    const securityGateChoice = new sfn.Choice(this, "RemediateOrAccept?")
+      .when(
+        sfn.Condition.stringEquals("$.securityDecision.action", "remediate"),
+        // Loop back: use the remediation bug text, re-triage
+        new sfn.Pass(this, "PrepareRemediation", {
+          parameters: {
+            "runId.$": "$.runId",
+            "bugText.$": "$.securityDecision.remediationBugText",
+            "kiroModel.$": "$.kiroModel",
+            "securityMode.$": "$.securityMode",
+            "decisionModelEnabled.$": "$.decisionModelEnabled",
+            "autoExecuteSimple": false,
+            "workflowVersion": 2,
+            "remediationCycle": true,
+          },
+        }).next(triage)
+      )
+      .otherwise(reportSuccess);
+
+    // If security review found issues, go to gate; if clean, go to report
+    const securityResultChoice = new sfn.Choice(this, "SecurityFindingsExist?")
+      .when(
+        sfn.Condition.booleanEquals("$.securityStart.passed", true),
+        reportSuccess
+      )
+      .otherwise(awaitSecurityGate);
+
+    awaitSecurityGate.next(securityGateChoice);
+
     const securityDone = new sfn.Choice(this, "SecurityDone?")
-      .when(sfn.Condition.booleanEquals("$.securityStart.complete", true), reportSuccess)
+      .when(sfn.Condition.booleanEquals("$.securityStart.complete", true), securityResultChoice)
       .otherwise(securityWait);
 
     // Async path: start security review but skip to report immediately
@@ -571,18 +727,83 @@ export class AdlcPocStack extends cdk.Stack {
     securityWait.next(securityCheck);
     securityCheck.next(securityDone);
 
+    // Retry automatically only while attempts are left AND the validator says another attempt
+    // can change the outcome; otherwise a person decides at the review gate.
     const validationChoice = new sfn.Choice(this, "ValidationGreen?")
       .when(sfn.Condition.booleanEquals("$.validation.pass", true), securityModeChoice)
       .when(
         sfn.Condition.and(
           sfn.Condition.booleanEquals("$.validation.pass", false),
-          sfn.Condition.numberLessThan("$.validation.fixAttempts", MAX_FIX_LOOPS)
+          sfn.Condition.or(
+            sfn.Condition.isNotPresent("$.validation.retryable"),
+            sfn.Condition.booleanEquals("$.validation.retryable", true)
+          ),
+          sfn.Condition.numberLessThanJsonPath("$.validation.fixAttempts", "$.budget.attemptBudget")
         ),
         implement
       )
-      .otherwise(reportNeedsHuman);
+      .otherwise(awaitReview);
 
-    triage.next(draft);
+    // Review decisions. Accept: continue with the fix branch as it is, through security review
+    // when the run asked for one; the report records ACCEPTED_BY_REVIEWER, never a green pass.
+    const useAcceptedFix = new sfn.Pass(this, "UseAcceptedFix", {
+      inputPath: "$.review.acceptedFix",
+      resultPath: "$.implementResult",
+    });
+    useAcceptedFix.next(securityModeChoice);
+    // Retry: a larger attempt budget and the (possibly edited) approved artifact, then implement.
+    const applyReviewBudget = new sfn.Pass(this, "ApplyReviewBudget", {
+      parameters: { "attemptBudget.$": "$.review.attemptBudget" },
+      resultPath: "$.budget",
+    });
+    const applyReviewArtifact = new sfn.Pass(this, "ApplyReviewArtifact", {
+      parameters: {
+        action: "execute",
+        approved: true,
+        "selectedMode.$": "$.review.selectedMode",
+        "selectedArtifact.$": "$.review.artifact",
+      },
+      resultPath: "$.approval",
+    });
+    applyReviewBudget.next(applyReviewArtifact).next(implement);
+    const reviewChoice = new sfn.Choice(this, "ReviewDecision?")
+      .when(sfn.Condition.stringEquals("$.review.action", "accept"), useAcceptedFix)
+      .when(sfn.Condition.stringEquals("$.review.action", "retry"), applyReviewBudget)
+      .otherwise(reportReviewClosed);
+    awaitReview.next(reviewChoice);
+    const reviewTimedOut = new sfn.Pass(this, "ReviewTimedOut", {
+      comment: `Nobody decided within ${REVIEW_TIMEOUT_DAYS} days; the run is closed.`,
+    });
+    reviewTimedOut.next(reportReviewTimeout);
+    // Before the generic failure catch below, so a timeout closes the run instead of failing it.
+    awaitReview.addCatch(reviewTimedOut, {
+      errors: ["States.Timeout"],
+      resultPath: "$.reviewTimeout",
+    });
+
+    // The decision model is informative only: it runs after triage when the run opts in, and
+    // every outcome (including a Lambda-level failure) continues to Draft. AutoExecuteSimple?
+    // still reads only $.triage.complexity, the LLM verdict.
+    const decisionModelSkipped = new sfn.Pass(this, "DecisionModelSkipped", {
+      comment: "The decision-model step failed; the run continues with the LLM triage.",
+    });
+    decisionModelSkipped.next(draft);
+    decisionModel.addCatch(decisionModelSkipped, {
+      errors: ["States.ALL"],
+      resultPath: "$.decisionModelError",
+    });
+    decisionModel.next(draft);
+    const decisionModelChoice = new sfn.Choice(this, "DecisionModelEnabled?")
+      .when(
+        sfn.Condition.and(
+          sfn.Condition.isPresent("$.decisionModelEnabled"),
+          sfn.Condition.booleanEquals("$.decisionModelEnabled", true)
+        ),
+        decisionModel
+      )
+      .otherwise(draft);
+
+    triage.next(decisionModelChoice);
     draft.next(autoExecuteChoice);
     autoDecision.next(executionChoice);
     awaitApproval.next(executionChoice);
@@ -595,10 +816,12 @@ export class AdlcPocStack extends cdk.Stack {
       [draft, "DRAFT"],
       [autoDecision, "AUTO_DECISION"],
       [awaitApproval, "APPROVAL"],
+      [awaitReview, "REVIEW"],
       [implement, "IMPLEMENT"],
       [validate, "VALIDATE"],
       [securityStart, "SECURITY_START"],
       [securityCheck, "SECURITY_CHECK"],
+      [awaitSecurityGate, "SECURITY_GATE"],
     ] as const) {
       const failureStage = new sfn.Pass(this, `${stage}FailureStage`, {
         result: sfn.Result.fromObject({ failureStage: stage }),
@@ -613,7 +836,8 @@ export class AdlcPocStack extends cdk.Stack {
 
     const stateMachine = new sfn.StateMachine(this, "BugFixWorkflow", {
       definitionBody: sfn.DefinitionBody.fromChainable(triage),
-      timeout: cdk.Duration.hours(25),
+      // The execution gate waits up to 24 h and each of up to 3 review rounds up to 7 days.
+      timeout: cdk.Duration.days(23),
       tracingEnabled: true,
       logs: {
         destination: new logs.LogGroup(this, "WorkflowLogs", {
@@ -673,11 +897,13 @@ export class AdlcPocStack extends cdk.Stack {
       RUNS_TABLE: runsTable.tableName,
       STATE_MACHINE_ARN: stateMachine.stateMachineArn,
       CONTEXT_TABLE: contextTable.tableName,
+      SETTINGS_TABLE: settingsTable.tableName,
     });
     startRunFn.addToRolePolicy(
       new iam.PolicyStatement({
+        // The caller's MCP config and the decision-model endpoint picked in Settings.
         actions: ["dynamodb:GetItem"],
-        resources: [contextTable.tableArn],
+        resources: [contextTable.tableArn, settingsTable.tableArn],
       })
     );
     const getRunsFn = apiFn("GetRunsFn", "get-runs.ts", {
@@ -688,7 +914,58 @@ export class AdlcPocStack extends cdk.Stack {
     });
     const getModelsFn = apiFn("GetModelsFn", "get-models.ts", {
       AGENT_RUNTIME_ARN: agentRuntime.attrAgentRuntimeArn,
+      DECIDER_VARIANTS,
+      DECIDER_MODEL_ID: DECIDER_MODEL.id,
+      SETTINGS_TABLE: settingsTable.tableName,
     });
+    // Reports whether the decision-model endpoint picked in Settings is deployed and in service.
+    getModelsFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["sagemaker:DescribeEndpoint"],
+        resources: decider.endpointArns,
+      })
+    );
+    getModelsFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["dynamodb:GetItem"],
+        resources: [settingsTable.tableArn],
+      })
+    );
+    // Settings: status, deploy and stop of the two on-demand decision-model endpoints (CPU and
+    // GPU), and which one the pipeline uses. Deploy can only create the two endpoint names from
+    // the two stack-owned configurations; every action is audited (PutItem/UpdateItem on the
+    // audit table) before SageMaker or the setting is changed.
+    const deciderEndpointFn = apiFn("DeciderEndpointFn", "decider-endpoint.ts", {
+      DECIDER_VARIANTS,
+      DECIDER_MODEL_ID: DECIDER_MODEL.id,
+      AUDIT_TABLE: resetAuditTable.tableName,
+      SETTINGS_TABLE: settingsTable.tableName,
+    });
+    deciderEndpointFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["sagemaker:DescribeEndpoint", "sagemaker:DeleteEndpoint"],
+        resources: decider.endpointArns,
+      })
+    );
+    deciderEndpointFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        // CreateEndpoint is authorized on both the endpoint and its endpoint configuration.
+        actions: ["sagemaker:CreateEndpoint"],
+        resources: [...decider.endpointArns, ...decider.endpointConfigArns],
+      })
+    );
+    deciderEndpointFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["dynamodb:PutItem", "dynamodb:UpdateItem"],
+        resources: [resetAuditTable.tableArn],
+      })
+    );
+    deciderEndpointFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["dynamodb:GetItem", "dynamodb:PutItem"],
+        resources: [settingsTable.tableArn],
+      })
+    );
     const repositoryReadFn = apiFn("RepositoryReadFn", "repository-read.ts", {
       REPO_NAME: repo.repositoryName,
       RUNS_TABLE: runsTable.tableName,
@@ -732,6 +1009,30 @@ export class AdlcPocStack extends cdk.Stack {
     runsTable.grantReadWriteData(decisionFn);
     stateMachine.grantStartExecution(startRunFn);
     stateMachine.grantTaskResponse(decisionFn);
+    // Review gate decisions: reads and claims the run record, then resumes the workflow.
+    const reviewDecisionFn = apiFn("ReviewDecisionFn", "review-decision.ts", {
+      RUNS_TABLE: runsTable.tableName,
+    });
+    reviewDecisionFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["dynamodb:GetItem", "dynamodb:UpdateItem"],
+        resources: [runsTable.tableArn],
+      })
+    );
+    stateMachine.grantTaskResponse(reviewDecisionFn);
+
+    // Update run model: allows changing kiroModel after triage recommendation
+    const updateRunModelFn = apiFn("UpdateRunModelFn", "update-run-model.ts", {
+      RUNS_TABLE: runsTable.tableName,
+    });
+    runsTable.grantReadWriteData(updateRunModelFn);
+
+    const securityDecisionFn = apiFn("SecurityDecisionFn", "security-decision.ts", {
+      RUNS_TABLE: runsTable.tableName,
+    });
+    runsTable.grantReadWriteData(securityDecisionFn);
+    stateMachine.grantTaskResponse(securityDecisionFn);
+
     repo.grantRead(repositoryReadFn);
     repositoryReadFn.addToRolePolicy(
       new iam.PolicyStatement({
@@ -744,18 +1045,11 @@ export class AdlcPocStack extends cdk.Stack {
     repoControlTable.grantReadWriteData(repositoryResetFn);
     resetAuditTable.grantReadWriteData(repositoryResetFn);
     repositoryResetFn.addEnvironment("STATE_MACHINE_ARN", stateMachine.stateMachineArn);
-    repositoryResetFn.addEnvironment("AGENT_SPACE_ID", "as-6b6ad79c-b406-4765-aa20-7e8a904e6f9e");
     repositoryResetFn.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ["states:ListExecutions", "states:StopExecution"],
         resources: [stateMachine.stateMachineArn, `${stateMachine.stateMachineArn}:*`,
           `arn:aws:states:${this.region}:${this.account}:execution:*`],
-      })
-    );
-    repositoryResetFn.addToRolePolicy(
-      new iam.PolicyStatement({
-        actions: ["securityagent:*"],
-        resources: ["*"],
       })
     );
     repositoryResetFn.addToRolePolicy(
@@ -871,6 +1165,11 @@ export class AdlcPocStack extends cdk.Stack {
       integration: new apigwv2Int.HttpLambdaIntegration("GetModelsInt", getModelsFn),
     });
     httpApi.addRoutes({
+      path: "/decision-model/endpoint",
+      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
+      integration: new apigwv2Int.HttpLambdaIntegration("DeciderEndpointInt", deciderEndpointFn),
+    });
+    httpApi.addRoutes({
       path: "/mcp/config",
       methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
       integration: new apigwv2Int.HttpLambdaIntegration("McpConfigInt", mcpApiFn),
@@ -945,6 +1244,21 @@ export class AdlcPocStack extends cdk.Stack {
       methods: [apigwv2.HttpMethod.POST],
       integration: new apigwv2Int.HttpLambdaIntegration("DecisionInt", decisionFn),
     });
+    httpApi.addRoutes({
+      path: "/runs/{runId}/review-decision",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: new apigwv2Int.HttpLambdaIntegration("ReviewDecisionInt", reviewDecisionFn),
+    });
+    httpApi.addRoutes({
+      path: "/runs/{runId}/model",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: new apigwv2Int.HttpLambdaIntegration("UpdateRunModelInt", updateRunModelFn),
+    });
+    httpApi.addRoutes({
+      path: "/runs/{runId}/security-decision",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: new apigwv2Int.HttpLambdaIntegration("SecurityDecisionInt", securityDecisionFn),
+    });
 
     // ------------------------------------------------------------------
     // UI hosting: private S3 + CloudFront (OAC)
@@ -973,7 +1287,61 @@ export class AdlcPocStack extends cdk.Stack {
       minimumProtocolVersion: cloudfront.SecurityPolicyProtocol.TLS_V1_2_2021,
     });
 
-    new s3deploy.BucketDeployment(this, "UiDeployment", {
+    // ------------------------------------------------------------------
+    // Security review: AWS Security Agent agent space, service role and the CloudFront domain as
+    // a target domain verified by HTTP route (the token is published by the UI deployment below).
+    // ------------------------------------------------------------------
+    const securityAgent = securityAgentEnabled
+      ? new SecurityAgent(this, "SecurityAgent", { contextBucket, distribution })
+      : undefined;
+    if (securityAgent) {
+      const agentSpaceArns = securityAgent.agentSpaceArns;
+      for (const fn of [securityStartFn, securityCheckFn, repositoryResetFn]) {
+        fn.addEnvironment("AGENT_SPACE_ID", securityAgent.agentSpaceId);
+      }
+      securityStartFn.addEnvironment("SERVICE_ROLE_ARN", securityAgent.serviceRole.roleArn);
+      securityStartFn.addToRolePolicy(new iam.PolicyStatement({
+        actions: [
+          "securityagent:CreateCodeReview",
+          "securityagent:StartCodeReviewJob",
+          "securityagent:CreatePentest",
+          "securityagent:StartPentestJob",
+        ],
+        resources: agentSpaceArns,
+      }));
+      // Code reviews and pentests run as the agent space's service role.
+      securityStartFn.addToRolePolicy(new iam.PolicyStatement({
+        actions: ["iam:PassRole"],
+        resources: [securityAgent.serviceRole.roleArn],
+      }));
+      securityCheckFn.addToRolePolicy(new iam.PolicyStatement({
+        actions: [
+          "securityagent:ListCodeReviewJobsForCodeReview",
+          "securityagent:ListCodeReviewJobTasks",
+          "securityagent:ListPentestJobsForPentest",
+          "securityagent:ListPentestJobTasks",
+          "securityagent:ListFindings",
+        ],
+        resources: agentSpaceArns,
+      }));
+      // Restore-buggy-state stops review jobs that are still running.
+      repositoryResetFn.addToRolePolicy(new iam.PolicyStatement({
+        actions: [
+          "securityagent:ListPentests",
+          "securityagent:ListPentestJobsForPentest",
+          "securityagent:StopPentestJob",
+          "securityagent:ListCodeReviews",
+          "securityagent:ListCodeReviewJobsForCodeReview",
+          "securityagent:StopCodeReviewJob",
+        ],
+        resources: agentSpaceArns,
+      }));
+    }
+    for (const fn of [startRunFn, getModelsFn]) {
+      fn.addEnvironment("SECURITY_AGENT_ENABLED", String(securityAgentEnabled));
+    }
+
+    const uiDeployment = new s3deploy.BucketDeployment(this, "UiDeployment", {
       destinationBucket: uiBucket,
       distribution,
       sources: [
@@ -984,8 +1352,15 @@ export class AdlcPocStack extends cdk.Stack {
           userPoolId: userPool.userPoolId,
           userPoolClientId: userPoolClient.userPoolClientId,
         }),
+        // Proof of domain ownership for Security Agent; the token is not a secret.
+        ...(securityAgent
+          ? [s3deploy.Source.jsonData(SECURITY_AGENT_VERIFICATION_ROUTE, {
+              tokens: [securityAgent.verificationToken],
+            })]
+          : []),
       ],
     });
+    securityAgent?.verifyAfter(uiDeployment);
 
     // ------------------------------------------------------------------
     // Outputs
@@ -1001,5 +1376,31 @@ export class AdlcPocStack extends cdk.Stack {
     new cdk.CfnOutput(this, "AgentRuntimeArn", { value: agentRuntime.attrAgentRuntimeArn });
     new cdk.CfnOutput(this, "StateMachineArn", { value: stateMachine.stateMachineArn });
     new cdk.CfnOutput(this, "KiroKeySecretArn", { value: kiroKeySecret.secretArn });
+    // The CPU outputs keep their earlier names; the GPU ones are new.
+    const cpuDecider = decider.variant("cpu");
+    const gpuDecider = decider.variant("gpu");
+    new cdk.CfnOutput(this, "DeciderEndpointName", {
+      value: cpuDecider.endpointName,
+      description: "CPU endpoint. Not deployed by cdk deploy; start and stop it from the Settings tab",
+    });
+    new cdk.CfnOutput(this, "DeciderEndpointConfigName", { value: cpuDecider.endpointConfigName });
+    new cdk.CfnOutput(this, "DeciderInstanceType", { value: cpuDecider.instanceType });
+    new cdk.CfnOutput(this, "DeciderGpuEndpointName", {
+      value: gpuDecider.endpointName,
+      description: "GPU endpoint. Not deployed by cdk deploy; start and stop it from the Settings tab",
+    });
+    new cdk.CfnOutput(this, "DeciderGpuEndpointConfigName", { value: gpuDecider.endpointConfigName });
+    new cdk.CfnOutput(this, "DeciderGpuInstanceType", { value: gpuDecider.instanceType });
+    new cdk.CfnOutput(this, "SettingsTableName", { value: settingsTable.tableName });
+    new cdk.CfnOutput(this, "SecurityAgentEnabled", { value: String(securityAgentEnabled) });
+    if (securityAgent) {
+      new cdk.CfnOutput(this, "SecurityAgentSpaceId", { value: securityAgent.agentSpaceId });
+      new cdk.CfnOutput(this, "SecurityAgentServiceRoleArn", { value: securityAgent.serviceRole.roleArn });
+      new cdk.CfnOutput(this, "SecurityAgentTargetDomainId", { value: securityAgent.targetDomainId });
+      new cdk.CfnOutput(this, "SecurityAgentDomainVerification", {
+        value: securityAgent.verificationStatus ?? "UNKNOWN",
+        description: "VERIFIED is required for penetration tests; code reviews work either way",
+      });
+    }
   }
 }
