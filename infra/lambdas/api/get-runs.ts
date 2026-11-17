@@ -21,7 +21,7 @@ export const handler = async (
 
   if (runId) {
     const res = await ddb.send(
-      new GetCommand({ TableName: TABLE, Key: { runId } })
+      new GetCommand({ TableName: TABLE, Key: { runId }, ConsistentRead: true })
     );
     if (!res.Item) return response(404, { error: "run not found" });
     const { taskToken: _omit, ...safe } = res.Item;

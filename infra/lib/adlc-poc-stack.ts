@@ -307,6 +307,7 @@ export class AdlcPocStack extends cdk.Stack {
       env: { VALIDATE_MODEL_ID },
     });
     const reportFn = stepFn("ReportFn", "report.ts");
+    const awaitSecurityGateFn = stepFn("AwaitSecurityGateFn", "await-security-gate.ts");
     const securityStartFn = stepFn("SecurityStartFn", "security-review-start.ts", {
       timeout: cdk.Duration.minutes(5),
       memory: 1024,
@@ -326,7 +327,7 @@ export class AdlcPocStack extends cdk.Stack {
     }));
     repo.grantRead(securityStartFn);
 
-    for (const fn of [triageFn, draftFn, autoDecisionFn, awaitApprovalFn, awaitReviewFn, implementFn, validateFn, reportFn, securityStartFn, securityCheckFn]) {
+    for (const fn of [triageFn, draftFn, autoDecisionFn, awaitApprovalFn, awaitReviewFn, implementFn, validateFn, reportFn, securityStartFn, securityCheckFn, awaitSecurityGateFn]) {
       runsTable.grantReadWriteData(fn);
     }
     // Bedrock access, limited to the models each function uses. A US cross-Region inference
@@ -640,8 +641,50 @@ export class AdlcPocStack extends cdk.Stack {
       maxAttempts: 3,
     });
 
+    // Security Gate: human decides whether to remediate findings or accept risks
+    const awaitSecurityGate = new tasks.LambdaInvoke(this, "AwaitSecurityGate", {
+      lambdaFunction: awaitSecurityGateFn,
+      integrationPattern: sfn.IntegrationPattern.WAIT_FOR_TASK_TOKEN,
+      payload: sfn.TaskInput.fromObject({
+        "runId.$": "$.runId",
+        taskToken: sfn.JsonPath.taskToken,
+        "securityStart.$": "$.securityStart",
+      }),
+      resultPath: "$.securityDecision",
+      taskTimeout: sfn.Timeout.duration(cdk.Duration.hours(24)),
+    });
+
+    const securityGateChoice = new sfn.Choice(this, "RemediateOrAccept?")
+      .when(
+        sfn.Condition.stringEquals("$.securityDecision.action", "remediate"),
+        // Loop back: use the remediation bug text, re-triage
+        new sfn.Pass(this, "PrepareRemediation", {
+          parameters: {
+            "runId.$": "$.runId",
+            "bugText.$": "$.securityDecision.remediationBugText",
+            "kiroModel.$": "$.kiroModel",
+            "securityMode.$": "$.securityMode",
+            "decisionModelEnabled.$": "$.decisionModelEnabled",
+            "autoExecuteSimple": false,
+            "workflowVersion": 2,
+            "remediationCycle": true,
+          },
+        }).next(triage)
+      )
+      .otherwise(reportSuccess);
+
+    // If security review found issues, go to gate; if clean, go to report
+    const securityResultChoice = new sfn.Choice(this, "SecurityFindingsExist?")
+      .when(
+        sfn.Condition.booleanEquals("$.securityStart.passed", true),
+        reportSuccess
+      )
+      .otherwise(awaitSecurityGate);
+
+    awaitSecurityGate.next(securityGateChoice);
+
     const securityDone = new sfn.Choice(this, "SecurityDone?")
-      .when(sfn.Condition.booleanEquals("$.securityStart.complete", true), reportSuccess)
+      .when(sfn.Condition.booleanEquals("$.securityStart.complete", true), securityResultChoice)
       .otherwise(securityWait);
 
     // Async path: start security review but skip to report immediately
@@ -778,6 +821,7 @@ export class AdlcPocStack extends cdk.Stack {
       [validate, "VALIDATE"],
       [securityStart, "SECURITY_START"],
       [securityCheck, "SECURITY_CHECK"],
+      [awaitSecurityGate, "SECURITY_GATE"],
     ] as const) {
       const failureStage = new sfn.Pass(this, `${stage}FailureStage`, {
         result: sfn.Result.fromObject({ failureStage: stage }),
@@ -976,6 +1020,19 @@ export class AdlcPocStack extends cdk.Stack {
       })
     );
     stateMachine.grantTaskResponse(reviewDecisionFn);
+
+    // Update run model: allows changing kiroModel after triage recommendation
+    const updateRunModelFn = apiFn("UpdateRunModelFn", "update-run-model.ts", {
+      RUNS_TABLE: runsTable.tableName,
+    });
+    runsTable.grantReadWriteData(updateRunModelFn);
+
+    const securityDecisionFn = apiFn("SecurityDecisionFn", "security-decision.ts", {
+      RUNS_TABLE: runsTable.tableName,
+    });
+    runsTable.grantReadWriteData(securityDecisionFn);
+    stateMachine.grantTaskResponse(securityDecisionFn);
+
     repo.grantRead(repositoryReadFn);
     repositoryReadFn.addToRolePolicy(
       new iam.PolicyStatement({
@@ -1191,6 +1248,16 @@ export class AdlcPocStack extends cdk.Stack {
       path: "/runs/{runId}/review-decision",
       methods: [apigwv2.HttpMethod.POST],
       integration: new apigwv2Int.HttpLambdaIntegration("ReviewDecisionInt", reviewDecisionFn),
+    });
+    httpApi.addRoutes({
+      path: "/runs/{runId}/model",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: new apigwv2Int.HttpLambdaIntegration("UpdateRunModelInt", updateRunModelFn),
+    });
+    httpApi.addRoutes({
+      path: "/runs/{runId}/security-decision",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: new apigwv2Int.HttpLambdaIntegration("SecurityDecisionInt", securityDecisionFn),
     });
 
     // ------------------------------------------------------------------

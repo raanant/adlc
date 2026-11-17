@@ -49,8 +49,12 @@ async function apiCall(operation: string, body: Record<string, unknown>): Promis
       res.on("end", () => {
         const text = Buffer.concat(chunks).toString();
         console.log(`API ${operation} ${res.statusCode}: ${text.slice(0, 500)}`);
+        if (res.statusCode && res.statusCode >= 400) {
+          reject(new Error(`API ${operation} ${res.statusCode}: ${text.slice(0, 500)}`));
+          return;
+        }
         try { resolve(JSON.parse(text)); }
-        catch { res.statusCode && res.statusCode >= 400 ? reject(new Error(`API ${res.statusCode}: ${text.slice(0, 500)}`)) : resolve(text); }
+        catch { resolve(text); }
       });
     });
     req.on("error", reject);
@@ -155,17 +159,23 @@ export const handler = async (
       assets: { sourceCode: [{ s3Location }] },
       serviceRole: SERVICE_ROLE_ARN,
       codeRemediationStrategy: "AUTOMATIC",
-    })) as { codeReviewId: string };
+    })) as Record<string, unknown>;
     console.log("CreateCodeReview response:", JSON.stringify(crResp));
-    codeReviewId = crResp.codeReviewId;
+    if (crResp.message && !crResp.codeReviewId) {
+      throw new Error(String(crResp.message));
+    }
+    codeReviewId = String(crResp.codeReviewId ?? "");
     await appendEvent(runId, "SECURITY_REVIEW", `📋 Code review created: ${codeReviewId}`);
 
     const crJobResp = (await apiCall("StartCodeReviewJob", {
       codeReviewId,
       agentSpaceId: AGENT_SPACE_ID,
-    })) as { codeReviewJobId: string };
+    })) as Record<string, unknown>;
     console.log("StartCodeReviewJob response:", JSON.stringify(crJobResp));
-    codeReviewJobId = crJobResp.codeReviewJobId;
+    if (crJobResp.message && !crJobResp.codeReviewJobId) {
+      throw new Error(String(crJobResp.message));
+    }
+    codeReviewJobId = String(crJobResp.codeReviewJobId ?? "");
     await appendEvent(runId, "SECURITY_REVIEW", `📋 Code review job started: ${codeReviewJobId}`);
   } catch (err) {
     await appendEvent(runId, "SECURITY_REVIEW", `⚠️ Code review failed to start: ${String(err).slice(0, 300)}`);
@@ -184,15 +194,23 @@ export const handler = async (
       },
       serviceRole: SERVICE_ROLE_ARN,
       codeRemediationStrategy: "AUTOMATIC",
-    })) as { pentestId: string };
-    pentestId = ptResp.pentestId;
+    })) as Record<string, unknown>;
+    console.log("CreatePentest response:", JSON.stringify(ptResp));
+    if (ptResp.message && !ptResp.pentestId) {
+      throw new Error(String(ptResp.message));
+    }
+    pentestId = String(ptResp.pentestId ?? "");
     await appendEvent(runId, "SECURITY_REVIEW", `🔍 Pentest created: ${pentestId}`);
 
     const ptJobResp = (await apiCall("StartPentestJob", {
       pentestId,
       agentSpaceId: AGENT_SPACE_ID,
-    })) as { pentestJobId: string };
-    pentestJobId = ptJobResp.pentestJobId;
+    })) as Record<string, unknown>;
+    console.log("StartPentestJob response:", JSON.stringify(ptJobResp));
+    if (ptJobResp.message && !ptJobResp.pentestJobId) {
+      throw new Error(String(ptJobResp.message));
+    }
+    pentestJobId = String(ptJobResp.pentestJobId ?? "");
     await appendEvent(runId, "SECURITY_REVIEW", `🔍 Pentest job started: ${pentestJobId}`);
   } catch (err) {
     await appendEvent(runId, "SECURITY_REVIEW", `⚠️ Pentest failed to start: ${String(err).slice(0, 300)}`);

@@ -54,6 +54,8 @@ interface Finding {
   confidence: string;
   status: string;
   findingId: string;
+  remediation: string;
+  description: string;
 }
 
 interface PentestTask {
@@ -98,13 +100,17 @@ async function fetchFindings(jobIdField: string, jobId: string): Promise<Finding
     const resp = (await apiCall("ListFindings", {
       [jobIdField]: jobId,
       agentSpaceId: AGENT_SPACE_ID,
-    })) as { findingsSummaries: Finding[] };
+    })) as { findingsSummaries: Array<Record<string, unknown>> };
+    console.log("ListFindings response sample:", JSON.stringify(resp.findingsSummaries?.[0] ?? "none").slice(0, 1000));
+    console.log("ListFindings fields:", JSON.stringify(Object.keys(resp.findingsSummaries?.[0] ?? {})));
     return (resp.findingsSummaries ?? []).map((f) => ({
-      name: f.name ?? "Unknown",
-      riskLevel: f.riskLevel ?? "UNKNOWN",
-      confidence: f.confidence ?? "UNKNOWN",
-      status: f.status ?? "ACTIVE",
-      findingId: f.findingId ?? "",
+      name: String(f.name ?? "Unknown"),
+      riskLevel: String(f.riskLevel ?? "UNKNOWN"),
+      confidence: String(f.confidence ?? "UNKNOWN"),
+      status: String(f.status ?? "ACTIVE"),
+      findingId: String(f.findingId ?? ""),
+      remediation: String(f.remediation ?? f.suggestedFix ?? f.recommendation ?? ""),
+      description: String(f.description ?? f.details ?? ""),
     }));
   } catch {
     return [];
@@ -219,6 +225,25 @@ export const handler = async (
 
     // Merge all findings
     const allFindings = [...codeReviewFindings, ...pentestFindings];
+
+    // Enrich HIGH/CRITICAL findings with GetFinding details
+    const importantFindings = allFindings.filter((f) => f.riskLevel === "HIGH" || f.riskLevel === "CRITICAL");
+    for (const f of importantFindings) {
+      if (!f.findingId) continue;
+      try {
+        const detail = (await apiCall("GetFinding", {
+          findingId: f.findingId,
+          agentSpaceId: AGENT_SPACE_ID,
+        })) as Record<string, unknown>;
+        console.log(`GetFinding ${f.findingId} keys:`, JSON.stringify(Object.keys(detail)));
+        console.log(`GetFinding ${f.findingId} sample:`, JSON.stringify(detail).slice(0, 1500));
+        f.remediation = String(detail.remediation ?? detail.suggestedFix ?? detail.recommendation ?? f.remediation ?? "");
+        f.description = String(detail.description ?? detail.details ?? detail.summary ?? f.description ?? "");
+      } catch (err) {
+        console.log(`GetFinding ${f.findingId} failed:`, String(err).slice(0, 300));
+      }
+    }
+
     const criticalCount = allFindings.filter((f) => f.riskLevel === "CRITICAL").length;
     const highCount = allFindings.filter((f) => f.riskLevel === "HIGH").length;
     const mediumCount = allFindings.filter((f) => f.riskLevel === "MEDIUM").length;
@@ -228,7 +253,7 @@ export const handler = async (
     // --- Fetch pentest task hours and calculate cost ---
     let pentestTaskHours = 0;
     let pentestCostUsd = 0;
-    if (pentestComplete && s.pentestJobId) {
+    if (s.pentestJobId) {
       try {
         let allTasks: PentestTask[] = [];
         let nextToken: string | undefined;
@@ -237,11 +262,48 @@ export const handler = async (
             agentSpaceId: AGENT_SPACE_ID,
             pentestJobId: s.pentestJobId,
             ...(nextToken ? { nextToken } : {}),
-          })) as { taskSummaries: PentestTask[]; nextToken?: string };
-          allTasks = allTasks.concat(tasksResp.taskSummaries ?? []);
-          nextToken = tasksResp.nextToken ?? undefined;
+          })) as Record<string, unknown>;
+          console.log("ListPentestJobTasks response keys:", JSON.stringify(Object.keys(tasksResp)));
+          console.log("ListPentestJobTasks first task sample:", JSON.stringify(((tasksResp.taskSummaries ?? tasksResp.tasks) as PentestTask[] | undefined)?.[0] ?? "none").slice(0, 500));
+          const tasks = (tasksResp.taskSummaries ?? tasksResp.tasks ?? []) as PentestTask[];
+          allTasks = allTasks.concat(tasks);
+          nextToken = (tasksResp.nextToken as string | undefined) ?? undefined;
         } while (nextToken);
-        pentestTaskHours = allTasks.reduce((sum, t) => sum + (t.taskHours ?? 0), 0);
+        pentestTaskHours = allTasks.reduce((sum, t) => {
+          // Try multiple possible field names for task duration
+          const hours = (t as Record<string, unknown>).taskHours
+            ?? (t as Record<string, unknown>).durationHours
+            ?? (t as Record<string, unknown>).hours
+            ?? (t as Record<string, unknown>).duration
+            ?? 0;
+          return sum + (typeof hours === "number" ? hours : 0);
+        }, 0);
+        // If no taskHours found but we have tasks, estimate from wall clock
+        if (pentestTaskHours === 0 && allTasks.length > 0) {
+          console.log("No taskHours found in tasks, falling back to task count estimate");
+          console.log("All task fields:", JSON.stringify(Object.keys(allTasks[0] ?? {})));
+          // Try to compute from task start/end timestamps
+          let totalMs = 0;
+          for (const t of allTasks) {
+            const task = t as Record<string, unknown>;
+            const start = task.startedAt ?? task.startTime ?? task.createdAt;
+            const end = task.completedAt ?? task.endTime ?? task.updatedAt;
+            if (typeof start === "string" && typeof end === "string") {
+              const ms = new Date(end).getTime() - new Date(start).getTime();
+              if (ms > 0) totalMs += ms;
+            }
+          }
+          if (totalMs > 0) {
+            pentestTaskHours = Math.round((totalMs / 3_600_000) * 100) / 100;
+            console.log(`Estimated ${pentestTaskHours} task-hours from task timestamps`);
+          } else {
+            // Last resort: use the events timeline to estimate duration
+            // The security review start event and this completion give wall clock time
+            // Each task counts as a minimum billing unit
+            pentestTaskHours = Math.round((allTasks.length * (1 / 60)) * 100) / 100; // 1 min per task minimum
+            console.log(`Fallback estimate: ${allTasks.length} tasks × 1min = ${pentestTaskHours} task-hours`);
+          }
+        }
         pentestCostUsd = Math.round(pentestTaskHours * PENTEST_COST_PER_TASK_HOUR * 100) / 100;
         await appendEvent(runId, "SECURITY_REVIEW",
           `💰 Pentest cost: ${pentestTaskHours.toFixed(2)} task-hours × $${PENTEST_COST_PER_TASK_HOUR}/hr = $${pentestCostUsd.toFixed(2)}`,

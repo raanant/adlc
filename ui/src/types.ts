@@ -90,6 +90,8 @@ export interface ModelsResponse {
 
 export type ExecutionMode = "SIMPLE" | "COMPLEX";
 
+export type TriageMode = "llm" | "both";
+
 export interface StartRunRequest {
   bugText: string;
   kiroModel: string;
@@ -98,6 +100,8 @@ export interface StartRunRequest {
   includeContext: boolean;
   autoExecuteSimple: boolean;
   securityMode: "skip" | "scan" | "remediate";
+  triageMode: TriageMode;
+  /** @deprecated Use triageMode instead. Kept for Step Function backward compatibility. */
   decisionModelEnabled: boolean;
 }
 
@@ -117,6 +121,9 @@ export interface Triage {
   estimatedFiles: number;
   bugId: string;
   title: string;
+  recommendedModel?: string;
+  alternativeModel?: string;
+  modelReasoning?: string;
 }
 
 /**
@@ -383,6 +390,12 @@ export interface Run {
   artifactVersions?: Array<{ version: number; artifact: string; createdBy: string; createdAt: string; source: string }>;
   baselineBuild?: { ok: boolean; errors: string[]; commitId?: string };
   securityReview?: SecurityReview;
+  securityDecision?: {
+    action: "accept" | "remediate";
+    feedback?: string;
+    reviewer?: string;
+    decidedAt?: string;
+  };
 }
 
 export interface SecurityReview {
@@ -398,6 +411,8 @@ export interface SecurityReview {
     confidence: string;
     status: string;
     findingId: string;
+    remediation?: string;
+    description?: string;
   }>;
   codeReviewId?: string;
   codeReviewJobId?: string;

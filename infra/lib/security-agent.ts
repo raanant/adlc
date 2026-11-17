@@ -94,15 +94,14 @@ export class SecurityAgent extends Construct {
     );
     role.addToPolicy(
       new iam.PolicyStatement({
-        actions: ["s3:GetObject"],
+        actions: ["s3:GetObject", "s3:GetObjectVersion"],
         resources: [props.contextBucket.arnForObjects(`${SECURITY_REVIEW_PREFIX}*`)],
       })
     );
     role.addToPolicy(
       new iam.PolicyStatement({
-        actions: ["s3:ListBucket"],
+        actions: ["s3:ListBucket", "s3:GetBucketLocation"],
         resources: [props.contextBucket.bucketArn],
-        conditions: { StringLike: { "s3:prefix": [`${SECURITY_REVIEW_PREFIX}*`] } },
       })
     );
 

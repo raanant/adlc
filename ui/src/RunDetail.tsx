@@ -32,7 +32,7 @@ const PHASE_ICONS: Record<string, string> = {
 /** Badge colour for a run status: green only for a validated, completed run. */
 export function runStatusTone(status: string | null): "ok" | "warn" | "bad" | "info" {
   if (status === "COMPLETED") return "ok";
-  if (status && ["AWAITING_APPROVAL", "AWAITING_REVIEW", "ACCEPTED_BY_REVIEWER", "CANCELLED"].includes(status)) return "warn";
+  if (status && ["AWAITING_APPROVAL", "AWAITING_REVIEW", "AWAITING_SECURITY_GATE", "ACCEPTED_BY_REVIEWER", "CANCELLED"].includes(status)) return "warn";
   if (status && ["FAILED", "REJECTED", "NEEDS_HUMAN"].includes(status)) return "bad";
   return "info";
 }
@@ -44,7 +44,7 @@ function safeUsageStatus(value: unknown): UsageStatus {
     : "UNAVAILABLE";
 }
 
-function ApprovalPanel({ run, onChanged }: { run: Run; onChanged: () => void }) {
+function ApprovalPanel({ run, onChanged, onModelApplied }: { run: Run; onChanged: () => void; onModelApplied?: (model: string) => void }) {
   const recommendedMode: ExecutionMode =
     run.triage?.complexity === "COMPLEX" ? "COMPLEX" : "SIMPLE";
   const [selectedMode, setSelectedMode] = useState<ExecutionMode>(recommendedMode);
@@ -120,6 +120,8 @@ function ApprovalPanel({ run, onChanged }: { run: Run; onChanged: () => void }) 
         </button>
       </div>
 
+      <ModelRecommendationCard run={run} onChanged={onChanged} onModelApplied={onModelApplied} />
+
       <label className="field-label" htmlFor="approved-artifact">
         {selectedMode === "SIMPLE" ? "Approved implementation prompt" : "Approved Markdown spec"}
       </label>
@@ -139,6 +141,7 @@ function ApprovalPanel({ run, onChanged }: { run: Run; onChanged: () => void }) 
         <span>{artifact.length.toLocaleString()} / 50,000 characters</span>
         <span>Validation will use this exact frozen artifact.</span>
       </div>
+
       <textarea
         rows={3}
         maxLength={4000}
@@ -307,6 +310,108 @@ function SecurityReviewCard({ securityReview }: { securityReview?: SecurityRevie
       ) : (
         <p style={{ color: "#22c55e", fontWeight: 500 }}>✅ No security issues found</p>
       )}
+    </section>
+  );
+}
+
+function SecurityGatePanel({ run, onChanged }: { run: Run; onChanged: () => void }) {
+  const status = optionalString(run.status);
+  const runId = optionalString(run.runId);
+  const securityReview = run.securityReview;
+  const [busy, setBusy] = useState(false);
+  const [feedback, setFeedback] = useState("");
+  const [decided, setDecided] = useState(false);
+
+  if (status !== "AWAITING_SECURITY_GATE" || !runId || !securityReview) return null;
+
+  const findings = securityReview.findings ?? [];
+  const actionable = findings.filter((f) => f.riskLevel === "HIGH" || f.riskLevel === "CRITICAL");
+
+  async function decide(action: "accept" | "remediate") {
+    setBusy(true);
+    try {
+      await api.securityDecision(runId!, action, feedback || undefined);
+      setDecided(true);
+      setTimeout(() => onChanged(), 1000);
+    } catch (err) {
+      alert(`Failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (decided) {
+    return (
+      <section className="card" style={{ borderLeft: "3px solid #22c55e" }}>
+        <p style={{ color: "#22c55e", fontWeight: 500 }}>✅ Security gate decision submitted. Workflow resuming...</p>
+      </section>
+    );
+  }
+
+  return (
+    <section className="card" style={{ borderLeft: "3px solid #f59e0b" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.75rem" }}>
+        <span style={{ fontSize: "1.4rem" }}>🛡️</span>
+        <h3 style={{ margin: 0 }}>Security Remediation Gate</h3>
+        <span style={{
+          marginLeft: "auto", padding: "0.2rem 0.6rem", borderRadius: "4px",
+          fontSize: "0.8rem", fontWeight: 600, color: "#fff", backgroundColor: "#f59e0b",
+        }}>AWAITING DECISION</span>
+      </div>
+
+      <p style={{ color: "#ccc", fontSize: "0.85rem", margin: "0 0 0.75rem" }}>
+        Security review found <strong>{findings.length}</strong> finding(s)
+        {actionable.length > 0 && <> including <strong style={{ color: "#ff4444" }}>{actionable.length} high/critical</strong></>}.
+        Choose to <strong>remediate</strong> (feed findings back to Kiro for a fix) or <strong>accept</strong> the risks.
+      </p>
+
+      {actionable.length > 0 && (
+        <div style={{ maxHeight: "250px", overflowY: "auto", marginBottom: "0.75rem", border: "1px solid #444", borderRadius: "4px", padding: "0.5rem" }}>
+          <h4 style={{ margin: "0 0 0.5rem", fontSize: "0.85rem", color: "#ff4444" }}>High/Critical Findings to Remediate</h4>
+          {actionable.map((f, i) => (
+            <div key={f.findingId || i} style={{ marginBottom: "0.5rem", padding: "0.4rem", backgroundColor: "#1a1a2e", borderRadius: "4px", fontSize: "0.82rem" }}>
+              <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
+                <span style={{ color: RISK_COLORS[f.riskLevel] || "#888", fontWeight: 600, fontSize: "0.75rem" }}>{f.riskLevel}</span>
+                <span style={{ color: "#eee" }}>{f.name}</span>
+              </div>
+              {f.description && <p style={{ color: "#aaa", margin: "0.3rem 0 0", fontSize: "0.8rem" }}>{f.description}</p>}
+              {f.remediation && <p style={{ color: "#7dd3fc", margin: "0.3rem 0 0", fontSize: "0.8rem" }}>💡 {f.remediation}</p>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <label className="field-label" htmlFor="security-gate-feedback">Additional guidance (optional)</label>
+      <textarea
+        id="security-gate-feedback"
+        className="artifact-editor"
+        rows={3}
+        maxLength={4000}
+        value={feedback}
+        onChange={(e) => setFeedback(e.target.value)}
+        placeholder="e.g. 'Focus on the SQL injection first' or 'Ignore the low-severity items'"
+        disabled={busy}
+      />
+
+      <div style={{ display: "flex", gap: "0.75rem", marginTop: "0.75rem" }}>
+        <button
+          type="button"
+          className="btn btn-primary"
+          disabled={busy}
+          onClick={() => decide("remediate")}
+          style={{ backgroundColor: "#f59e0b", borderColor: "#f59e0b" }}
+        >
+          {busy ? "Submitting..." : `🔄 Remediate (${actionable.length || findings.length} findings)`}
+        </button>
+        <button
+          type="button"
+          className="btn btn-secondary"
+          disabled={busy}
+          onClick={() => decide("accept")}
+        >
+          {busy ? "Submitting..." : "✅ Accept Risks"}
+        </button>
+      </div>
     </section>
   );
 }
@@ -490,6 +595,84 @@ function ReportCard({ run }: { run: Run }) {
   );
 }
 
+function ModelRecommendationCard({
+  run,
+  onChanged,
+  onModelApplied,
+}: {
+  run: Run;
+  onChanged: () => void;
+  onModelApplied?: (model: string) => void;
+}) {
+  const triage = safeRecord(run.triage);
+  const recommended = safeString(triage?.recommendedModel, "");
+  const alternative = safeString(triage?.alternativeModel, "");
+  const reasoning = safeString(triage?.modelReasoning, "");
+  const complexity = safeString(triage?.complexity, "");
+  const runId = optionalString(run.runId);
+  const status = optionalString(run.status);
+  const [busy, setBusy] = useState(false);
+  const [appliedModel, setAppliedModel] = useState<string | null>(null);
+  const blocked = ["IMPLEMENTING", "VALIDATING", "COMPLETED", "FAILED", "CANCELLED"];
+  const canChange = !blocked.includes(status ?? "");
+
+  // Use local override if we just applied, otherwise read from run
+  const currentModel = appliedModel ?? safeString(run.kiroModel, "auto");
+
+  if (!recommended) return null;
+
+  const alreadySet = currentModel === recommended;
+
+  const applyModel = async (model: string) => {
+    if (!runId || busy) return;
+    setBusy(true);
+    try {
+      await api.updateRunModel(runId, model);
+      setAppliedModel(model);
+      onModelApplied?.(model);
+      window.dispatchEvent(new CustomEvent("adlc:model-applied", { detail: model }));
+      // Small delay to let DynamoDB consistent read catch up
+      await new Promise(r => setTimeout(r, 500));
+      onChanged();
+    } catch (e) {
+      console.error("Failed to update model", e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="card" style={{ padding: "1rem", marginBottom: "0.75rem" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.5rem" }}>
+        <span className="eyebrow">MODEL RECOMMENDATION</span>
+        <span className={`badge ${complexity === "SIMPLE" ? "ok" : "warn"}`}>{complexity}</span>
+      </div>
+      <p style={{ margin: "0.25rem 0" }}>
+        We recommend implementation with <strong>{recommended}</strong>
+        {alternative && <> &middot; alternative <strong>{alternative}</strong></>}
+      </p>
+      {reasoning && <p className="muted" style={{ margin: "0.25rem 0" }}>{reasoning}</p>}
+      <p className="muted" style={{ margin: "0.25rem 0" }}>
+        Current implementation model: <code>{currentModel}</code>
+      </p>
+      {canChange && !alreadySet ? (
+        <button
+          className="primary"
+          disabled={busy}
+          style={{ marginTop: "0.5rem" }}
+          onClick={() => void applyModel(recommended)}
+        >
+          {busy ? "Applying\u2026" : `Use ${recommended} for the coding agent`}
+        </button>
+      ) : alreadySet ? (
+        <p className="muted" style={{ marginTop: "0.25rem" }}>
+          \u2713 Implementation model set to <code>{recommended}</code>
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
 export function RunDetail({
   run,
   onChanged,
@@ -503,6 +686,8 @@ export function RunDetail({
   const status = optionalString(run.status);
   const triage = safeRecord(run.triage);
   const implementation = safeRecord(run.implementResult);
+  const [modelOverride, setModelOverride] = useState<string | null>(null);
+  const effectiveKiroModel = modelOverride ?? safeString(run.kiroModel, "auto");
   const validation = safeRecord(run.validation);
   const issues = safeArray<unknown>(validation?.issues);
   const checks = safeObjectArray<Record<string, unknown>>(validation?.checks);
@@ -541,7 +726,7 @@ export function RunDetail({
 
       <p className="muted model-summary">
         Analysis model: <code>{safeString(run.analysisModel, "default")}</code>
-        {" · "}Implementation model: <code>{safeString(run.kiroModel, "auto")}</code>
+        {" · "}Implementation model: <code>{effectiveKiroModel}</code>
         {optionalString(implementation?.actualModel) && (
           <> · Actual implementation model: <code>{safeString(implementation?.actualModel)}</code></>
         )}
@@ -550,7 +735,7 @@ export function RunDetail({
       </p>
 
       {status === "AWAITING_APPROVAL" && (
-        <ApprovalPanel run={run} onChanged={onChanged} />
+        <ApprovalPanel run={run} onChanged={onChanged} onModelApplied={setModelOverride} />
       )}
 
       {status === "AWAITING_REVIEW" && (
@@ -585,6 +770,7 @@ export function RunDetail({
 
       {/* Security Review Section */}
       <SecurityReviewCard securityReview={run.securityReview as SecurityReview | undefined} />
+      <SecurityGatePanel run={run} onChanged={onChanged} />
 
       {(implementation || validation || optionalString(run.fixBranch)) && (
         <section className="card verification-card" aria-labelledby="verification-title">

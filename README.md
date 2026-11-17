@@ -8,10 +8,17 @@ get a fully audited report with cost and resource usage.
 
 ## Features
 
-- **End-to-end pipeline** — triage → dual artifact draft (Simple prompt / Complex
+- **End-to-end pipeline** — triage → model recommendation → dual artifact draft (Simple prompt / Complex
   spec) → human approval gate → Kiro implementation → independent validation →
   bounded fix loop (max 3 attempts) → human review gate when the loop cannot finish →
-  report. Orchestrated by AWS Step Functions.
+  security review → security remediation gate → report. Orchestrated by AWS Step Functions.
+- **AI model recommendation** — the triage LLM recommends a coding model based on
+  bug complexity (e.g. Haiku for simple fixes, Sonnet for complex ones). The
+  recommendation appears in the execution gate with a one-click "Use X" button
+  that updates both the run's implementation model and the new-run form dropdown.
+- **Triage modes** — two-option dropdown: *LLM only* (default) or *LLM + Decision
+  model* (disabled when no endpoint is running). The decision model provides an
+  independent second opinion on complexity.
 - **Frozen artifacts** — the prompt or spec you approve is executed byte-for-byte
   on every automatic attempt; only a reviewer at the review gate can replace it, as a
   new recorded version.
@@ -30,11 +37,21 @@ get a fully audited report with cost and resource usage.
   from Kiro's structured stream output), in-container CPU / peak-memory
   sampling via cgroup v2, and Security Agent pentest task-hours ($50/hr), per run.
 - **AWS Security Agent integration** — optional code review + penetration test
-  (DAST) after validation via AWS Security Agent (Continuum). Three modes:
-  Skip, Scan only (async, fire-and-forget), or Scan & remediate (polls until
-  complete, collects findings). Pentest cost is calculated from actual task-hours
-  fetched from the Security Agent API.
-- **Decision model second opinion (optional)** — a per-run option that also asks
+  (DAST) after validation via AWS Security Agent (Continuum). Two modes:
+  Skip or Scan & remediate (polls until complete, collects findings). Pentest
+  cost is calculated from actual task-hours fetched from the Security Agent API,
+  with fallback estimation from task timestamps when `taskHours` is unavailable.
+- **Security remediation gate** — when security review finds HIGH or CRITICAL
+  findings, the pipeline pauses at a human gate showing all findings with
+  descriptions and remediation suggestions. The operator can:
+  - **Remediate** — findings are formatted as a new bug report and fed back to
+    triage, restarting the full cycle (triage → draft → gate → implement →
+    validate → security review).
+  - **Accept risks** — acknowledges findings and continues to report.
+  If the security review passes clean (zero critical/high), it skips the gate
+  and goes straight to report.
+- **Decision model second opinion (optional)** — select "LLM + Decision model" in the
+  triage mode dropdown to also ask
   [Strands Decider](https://github.com/strands-labs/strands-decider), a small decision model,
   to answer five yes/no checks about the bug report, from which a SIMPLE or COMPLEX verdict and
   its likelihood follow. The result is shown next to the LLM triage (agrees/disagrees), with each
@@ -53,16 +70,23 @@ React SPA (CloudFront + S3, Cognito auth)
         │
         ▼
 API Gateway (HTTP API, JWT authorizer) ── Lambdas: runs, decision, models,
-        │                                  repository, context, mcp
+        │                                  repository, context, mcp,
+        │                                  security-decision, update-run-model
         ▼
 Step Functions state machine
-  TRIAGE ─ [DECISION MODEL] ─ DRAFT ─ (auto-)GATE ─ IMPLEMENT ─ VALIDATE ─ SECURITY ─┐
-     ▲            │                                    │                    │        │ fail (≤3)
-     │            ▼                                    ▼                    ▼        ▼
-  Bedrock   SageMaker endpoint                  Bedrock AgentCore    AWS Security Agent
-  (analysis (Strands Decider, optional,               │              (code review + pentest)
-   models)   informative only)                        ▼
-                                              CodeCommit repo (fix/<run-id> branches)
+  TRIAGE ─ [DECISION MODEL] ─ DRAFT ─ (auto-)GATE ─ IMPLEMENT ─ VALIDATE ──────────────────────────┐
+     ▲            │                        │           │         │ fail (≤3)      │
+     │            ▼                        ▼           ▼         ▼               ▼
+  Bedrock   SageMaker endpoint       Model Rec.   Bedrock AgentCore     SECURITY REVIEW
+  (analysis (Strands Decider,        (LLM picks         │                    │
+   models)   optional,               best model)        ▼                    ▼
+             informative only)                    CodeCommit repo    SECURITY GATE (human)
+                                                                     ┌──────────┤
+                                                                     │          │
+                                                                  Accept    Remediate
+                                                                     │          │
+                                                                     ▼          ▼
+                                                                   REPORT    TRIAGE (loop)
 ```
 
 Storage: DynamoDB (runs, context items + MCP config, repo control, reset audit),
@@ -157,15 +181,19 @@ does not start either billed endpoint.
 ## Usage
 
 1. On the **Workflow** tab, load a seeded bug preset (or paste your own bug
-   report), pick an analysis model, optionally enable context / auto-execute,
-   and start the run.
+   report), pick an analysis model, choose a triage mode (LLM only or LLM +
+   Decision model), optionally enable context / auto-execute, and start the run.
 2. Watch the pipeline timeline and live agent logs.
-3. At the gate, review and optionally edit the Simple prompt or Complex spec,
-   then execute.
-4. Read the report: verification panel, usage breakdown, validation checks.
-5. Click **Inspect fix** to see the before/after diff with evidence, or use the
+3. At the gate, review the model recommendation (click "Use X" to switch the
+   implementation model), review and optionally edit the Simple prompt or Complex
+   spec, then execute.
+4. After implementation and validation, the security review runs (if enabled).
+   If findings exist, decide at the security gate: remediate or accept.
+5. Read the report: verification panel, usage breakdown, validation checks,
+   security findings, and cost.
+6. Click **Inspect fix** to see the before/after diff with evidence, or use the
    **Repository** tab directly.
-6. Use **Restore buggy state** to reset the demo between sessions.
+7. Use **Restore buggy state** to reset the demo between sessions.
 
 The in-app 📖 **User guide** covers every screen and field in detail.
 
@@ -327,13 +355,12 @@ Close. With no decision within 7 days the run closes on its own (state machine t
 ## Security Agent integration
 
 The pipeline optionally integrates **AWS Security Agent** (Continuum) for automated
-security scanning after validation passes. The start-run form offers three modes:
+security scanning after validation passes. The start-run form offers two modes:
 
 | Mode | Behavior |
 |------|----------|
 | **Skip** | No security review; pipeline goes straight to report |
-| **Scan only** (default) | Kicks off code review + pentest asynchronously; run completes immediately |
-| **Scan & remediate** | Polls until both complete (up to 60 min); findings shown in run report |
+| **Scan & remediate** (default when enabled) | Polls until both code review and pentest complete (up to 60 min); findings shown in run; security gate if issues found |
 
 ### Provisioning
 
@@ -370,14 +397,35 @@ The run form then disables the security-review selector, and the API records any
 
 ### Security review card
 
-When a pentest completes, the run page shows a security card with findings by
+When a pentest completes (or times out), the run page shows a security card with findings by
 severity (Critical/High/Medium/Low) and a pass/fail verdict. The run passes
 security review only if there are zero Critical and zero High findings.
+
+### Security remediation gate
+
+When the security review finds HIGH or CRITICAL findings, the pipeline pauses at
+`AWAITING_SECURITY_GATE`. The UI shows a yellow "Security Remediation Gate" card with:
+
+- All HIGH/CRITICAL findings listed with descriptions and remediation suggestions
+  (enriched via `GetFinding` API when available)
+- An optional guidance text field for the reviewer
+- **🔄 Remediate** button — formats findings into a structured bug report and loops
+  back to Triage for a full remediation cycle
+- **✅ Accept Risks** button — continues to Report
+
+The remediation cycle reuses the same `runId` and goes through triage → draft →
+gate → implement → validate → security review again. Auto-execute is disabled for
+remediation cycles to ensure human review of the remediation approach.
+
+API: `POST /runs/{runId}/security-decision` with `{"action": "accept" | "remediate"}`.
 
 ### Cost tracking
 
 Pentest cost appears in the usage breakdown as a dedicated "Security review" card
-showing total task-hours, the $50/hr rate, and computed cost.
+showing total task-hours, the $50/hr rate, and computed cost. Cost is calculated
+whether the pentest completes normally or times out. When the API does not return
+`taskHours` per task, the Lambda estimates from task start/end timestamps, or
+falls back to a minimum-per-task estimate.
 
 ## Security notes
 
@@ -389,6 +437,9 @@ This is a proof of concept, not a production system:
 - The Kiro key secret and Cognito resources use `RemovalPolicy.DESTROY`.
 - The agent can only push `fix/*` branches; `main` is protected structurally and
   reset/delete operations require group membership plus typed confirmations.
+- The security gate (`POST /runs/{runId}/security-decision`) requires a verified
+  Cognito identity. Remediation loops are capped by the Step Function's
+  overall timeout (23 days).
 - The optional decision-model endpoints (CPU and GPU) are IAM-only and network-isolated. Any
   signed-in user can start or stop them and pick the one the pipeline uses from Settings, and
   each action is audited; see

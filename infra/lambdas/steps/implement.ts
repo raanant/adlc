@@ -92,7 +92,6 @@ export const handler = async (event: {
   validation?: { issues?: string[] };
 }): Promise<ImplementResult> => {
   const { runId, bugText } = event;
-  const kiroModel = event.kiroModel ?? "auto";
   const executionMode = event.executionMode ?? "SIMPLE";
   const approvedArtifact = event.approvedArtifact ?? "";
   if (executionMode !== "SIMPLE" && executionMode !== "COMPLEX") {
@@ -105,6 +104,11 @@ export const handler = async (event: {
   const runtimeSessionId = `${runId}-implement-${String(attempt).padStart(3, "0")}-session`;
   const fixBranch = `fix/${runId}`;
   const existingRun = await getRun(runId);
+  // Prefer kiroModel from DB (may have been updated after triage recommendation)
+  const kiroModel =
+    (typeof existingRun?.kiroModel === "string" && existingRun.kiroModel.trim())
+      ? existingRun.kiroModel.trim()
+      : (event.kiroModel ?? "auto");
   const mcpConfig =
     typeof existingRun?.mcpConfig === "string" ? existingRun.mcpConfig : "";
   let baseCommitId = String(existingRun?.baseCommitId ?? "");

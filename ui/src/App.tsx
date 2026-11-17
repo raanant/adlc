@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, type CSSProperties, type Keyb
 import { Authenticator } from "@aws-amplify/ui-react";
 import "@aws-amplify/ui-react/styles.css";
 import { api } from "./api";
-import type { DecisionModelStatus, ModelOption, Run } from "./types";
+import type { DecisionModelStatus, ModelOption, Run, TriageMode } from "./types";
 import { RunDetail, runStatusTone } from "./RunDetail";
 import { RepositoryBrowser } from "./RepositoryBrowser";
 import { ContextTab } from "./ContextTab";
@@ -101,6 +101,16 @@ function NewRunForm({ onStarted }: { onStarted: (runId: string) => void }) {
   const [bugText, setBugText] = useState("");
   const [kiroModel, setKiroModel] = useState("auto");
   const [models, setModels] = useState<ModelOption[]>([]);
+
+  // Listen for model recommendation applied in RunDetail
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const model = (e as CustomEvent).detail;
+      if (typeof model === "string" && model) setKiroModel(model);
+    };
+    window.addEventListener("adlc:model-applied", handler);
+    return () => window.removeEventListener("adlc:model-applied", handler);
+  }, []);
   const [analysisModel, setAnalysisModel] = useState("");
   const [analysisModels, setAnalysisModels] = useState<ModelOption[]>([]);
   const [triageInstruction, setTriageInstruction] = useState("");
@@ -108,7 +118,7 @@ function NewRunForm({ onStarted }: { onStarted: (runId: string) => void }) {
   const [autoExecuteSimple, setAutoExecuteSimple] = useState(false);
   const [securityMode, setSecurityMode] = useState<"skip" | "scan" | "remediate">("scan");
   const [securityAgentEnabled, setSecurityAgentEnabled] = useState(true);
-  const [decisionModelEnabled, setDecisionModelEnabled] = useState(false);
+  const [triageMode, setTriageMode] = useState<TriageMode>("llm");
   const [decisionModelStatus, setDecisionModelStatus] = useState<DecisionModelStatus | null>(null);
   const [kiroConfigured, setKiroConfigured] = useState(false);
   const [modelsLoading, setModelsLoading] = useState(true);
@@ -176,7 +186,8 @@ function NewRunForm({ onStarted }: { onStarted: (runId: string) => void }) {
         includeContext,
         autoExecuteSimple,
         securityMode,
-        decisionModelEnabled: decisionModelEnabled && decisionModelStatus?.available === true,
+        triageMode,
+        decisionModelEnabled: triageMode === "both",
       }));
       const runId = optionalString(result?.runId);
       if (!runId) throw new Error("The run started without a usable run ID.");
@@ -257,25 +268,27 @@ function NewRunForm({ onStarted }: { onStarted: (runId: string) => void }) {
         />
         <span><strong>Auto-execute simple fixes</strong><small>Skip human approval only when triage returns SIMPLE. Complex fixes always pause for review.</small></span>
       </label>
-      <label className={`include-context-option ${decisionModelStatus?.available ? "" : "option-disabled"}`}>
-        <input
-          type="checkbox"
-          checked={decisionModelEnabled && decisionModelStatus?.available === true}
-          disabled={modelsLoading || decisionModelStatus?.available !== true}
-          onChange={(event) => setDecisionModelEnabled(event.target.checked)}
-        />
-        <span>
-          <strong>Decision model second opinion</strong>
-          <small>
-            Also ask the Strands Decider model five yes/no checks about the bug, from which a
-            SIMPLE or COMPLEX verdict follows. Informative only: routing and auto-execution still
-            follow the LLM triage.
-          </small>
-          <small className="decision-model-availability">
-            {decisionModelStatusText(decisionModelStatus, modelsLoading)}
-          </small>
-        </span>
-      </label>
+      <div className="field-group">
+        <label className="field-label" htmlFor="triage-mode">Triage mode</label>
+        <select
+          id="triage-mode"
+          value={triageMode}
+          disabled={modelsLoading}
+          onChange={(e) => setTriageMode(e.target.value as TriageMode)}
+        >
+          <option value="llm">LLM only</option>
+          <option value="both" disabled={decisionModelStatus?.available !== true}>
+            LLM + Decision model
+          </option>
+        </select>
+        <small className="muted">
+          {triageMode === "llm" && "The LLM analyses the bug and decides SIMPLE or COMPLEX."}
+          {triageMode === "both" && "Both the LLM and the Strands Decider evaluate the bug independently. Routing follows the LLM verdict; the decision model provides a second opinion."}
+        </small>
+        <small className="decision-model-availability">
+          {decisionModelStatusText(decisionModelStatus, modelsLoading)}
+        </small>
+      </div>
       <label className="include-context-option">
         <span>
           <strong>Security review</strong>

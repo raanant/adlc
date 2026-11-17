@@ -123,6 +123,16 @@ export const api = {
       body: JSON.stringify({ confirmation, expectedCommitId }),
     }),
   getDeciderEndpoints: () => request<DeciderOverview>("/decision-model/endpoint"),
+  updateRunModel: (runId: string, kiroModel: string) =>
+    request<{ ok: boolean; kiroModel: string; previousModel: string }>(
+      `/runs/${runId}/model`,
+      { method: "POST", body: JSON.stringify({ kiroModel }) }
+    ),
+  securityDecision: (runId: string, action: "accept" | "remediate", feedback?: string) =>
+    request<{ ok: boolean; action: string }>(
+      `/runs/${runId}/security-decision`,
+      { method: "POST", body: JSON.stringify({ action, feedback }) }
+    ),
   deployDeciderEndpoint: (variant: DeciderVariantId) =>
     request<DeciderOverview & { actionId: string }>("/decision-model/endpoint", {
       method: "POST",
